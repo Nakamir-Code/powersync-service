@@ -17,12 +17,25 @@ export const BaseMongoConfig = t.object({
   database: t.string.optional(),
   username: t.string.optional(),
   password: t.string.optional(),
+  oidc: t
+    .object({
+      token_url: t.string,
+      token_headers: t.record(t.string).optional(),
+      expiry: t
+        .object({
+          field: t.string,
+          kind: t.literal('relative').or(t.literal('absolute')).optional()
+        })
+        .optional()
+    })
+    .optional(),
 
   reject_ip_ranges: t.array(t.string).optional()
 });
 
 export type BaseMongoConfig = t.Encoded<typeof BaseMongoConfig>;
 export type BaseMongoConfigDecoded = t.Decoded<typeof BaseMongoConfig>;
+export type MongoOidcConfig = NonNullable<BaseMongoConfigDecoded['oidc']>;
 
 /**
  * Connection parameters that can be parsed from the MongoDB URI query string.
@@ -43,6 +56,7 @@ export type NormalizedMongoConfig = {
   database: string;
   username: string;
   password: string;
+  oidc?: MongoOidcConfig;
   lookup: LookupFunction | undefined;
   connectionParams: MongoConnectionParams;
 };
@@ -158,6 +172,7 @@ export function normalizeMongoConfig(options: BaseMongoConfigDecoded): Normalize
 
     username,
     password,
+    oidc: options.oidc,
 
     lookup,
     connectionParams

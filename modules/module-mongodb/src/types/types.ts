@@ -49,6 +49,7 @@ export interface NormalizedMongoConnectionConfig {
 
   username?: string;
   password?: string;
+  oidc?: lib_mongo.MongoOidcConfig;
 
   lookup?: LookupFunction;
 

@@ -1,6 +1,9 @@
 export * from './alerts/alerts-index.js';
 export * as alerts from './alerts/alerts-index.js';
 
+export * from './auth/auth-index.js';
+export * as auth from './auth/auth-index.js';
+
 export * from './codec/codec-index.js';
 export * as codecs from './codec/codec-index.js';
 

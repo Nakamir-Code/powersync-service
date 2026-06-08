@@ -1,6 +1,7 @@
+import { fetchOidcToken, makeExpiryParser } from '@powersync/lib-services-framework';
 import * as mongo from 'mongodb';
 import * as timers from 'timers/promises';
-import { BaseMongoConfigDecoded, normalizeMongoConfig } from '../types/types.js';
+import { BaseMongoConfigDecoded, MongoOidcConfig, normalizeMongoConfig } from '../types/types.js';
 
 /**
  * Time for new connection to timeout.
@@ -50,10 +51,7 @@ export interface MongoConnectionOptions {
 export function createMongoClient(config: BaseMongoConfigDecoded, options?: MongoConnectionOptions) {
   const normalized = normalizeMongoConfig(config);
   return new mongo.MongoClient(normalized.uri, {
-    auth: {
-      username: normalized.username,
-      password: normalized.password
-    },
+    ...oidcHttpAuthOptions(normalized.oidc, normalized.username, normalized.password),
     // Time for connection to timeout
     connectTimeoutMS: MONGO_CONNECT_TIMEOUT_MS,
     // Time for individual requests to timeout
@@ -106,6 +104,26 @@ export async function waitForAuth(db: mongo.Db) {
       throw e;
     }
   }
+}
+
+/**
+ * MongoClient OIDC auth options; if null, uses SCRAM.
+ */
+export function oidcHttpAuthOptions(
+  oidc: MongoOidcConfig | undefined,
+  username?: string,
+  password?: string
+): mongo.MongoClientOptions {
+  if (oidc == null) {
+    return { auth: { username, password } };
+  }
+  // Expiry dialect is config-driven; default to the standard relative OAuth2 `expires_in`.
+  const parseExpiry = makeExpiryParser(oidc.expiry ?? { field: 'expires_in', kind: 'relative' });
+  return {
+    authMechanismProperties: {
+      OIDC_CALLBACK: () => fetchOidcToken(oidc.token_url, oidc.token_headers, { parseExpiry })
+    }
+  };
 }
 
 export const isMongoServerError = (error: any): error is mongo.MongoServerError => {

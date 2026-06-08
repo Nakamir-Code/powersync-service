@@ -1,4 +1,4 @@
-import { mongo } from '@powersync/lib-service-mongodb';
+import { mongo, oidcHttpAuthOptions } from '@powersync/lib-service-mongodb';
 
 import { BaseObserver } from '@powersync/lib-services-framework';
 import { BSON_DESERIALIZE_DATA_OPTIONS, POWERSYNC_VERSION } from '@powersync/service-core';
@@ -24,10 +24,7 @@ export class MongoManager extends BaseObserver<MongoManagerListener> {
 
     // The pool is lazy - no connections are opened until a query is performed.
     this.client = new mongo.MongoClient(options.uri, {
-      auth: {
-        username: options.username,
-        password: options.password
-      },
+      ...oidcHttpAuthOptions(options.oidc, options.username, options.password),
 
       lookup: options.lookup,
       // Time for connection to timeout (URL param overrides default)
