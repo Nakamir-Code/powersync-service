@@ -120,6 +120,7 @@ export function oidcHttpAuthOptions(
   // Expiry dialect is config-driven; default to the standard relative OAuth2 `expires_in`.
   const parseExpiry = makeExpiryParser(oidc.expiry ?? { field: 'expires_in', kind: 'relative' });
   return {
+    authMechanism: 'MONGODB-OIDC',
     authMechanismProperties: {
       OIDC_CALLBACK: () => fetchOidcToken(oidc.token_url, oidc.token_headers, { parseExpiry })
     }
