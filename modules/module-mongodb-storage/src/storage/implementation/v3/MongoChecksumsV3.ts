@@ -1,41 +1,64 @@
+import * as lib_mongo from '@powersync/lib-service-mongodb';
+import { ServiceAssertionError } from '@powersync/lib-services-framework';
 import {
   bson,
   BucketChecksum,
+  CheckpointChecksumInvalidatedError,
   FetchPartialBucketChecksum,
   InternalOpId,
+  isPartialChecksum,
   PartialChecksumMap,
-  PartialOrFullChecksum
+  PartialOrFullChecksum,
+  SingleSyncConfigBucketDefinitionMapping
 } from '@powersync/service-core';
-import { BucketDefinitionMapping } from '../BucketDefinitionMapping.js';
 import {
+  checksumFromAggregate,
   emptyChecksumForRequest,
-  FetchPartialBucketChecksumV3,
+  FetchPartialBucketChecksumByBucket,
+  FetchPartialBucketChecksumByDefinition,
   MongoChecksumOptions,
-  MongoChecksums
+  MongoChecksums,
+  MongoChecksumSessionContext
 } from '../MongoChecksums.js';
 import { VersionedPowerSyncMongoV3 } from './VersionedPowerSyncMongoV3.js';
+import { BucketDataDocumentV3 } from './models.js';
 
-export class MongoChecksumsV3 extends MongoChecksums {
+/**
+ * Checksum operations addressed by persisted definition id.
+ *
+ * Safe on any storage instance, including multi-config replication-side instances - no
+ * source resolution is involved. This is the only checksum surface the compactor may use.
+ */
+export interface DefinitionChecksumOperations {
+  computePartialChecksumsDirectByDefinition(
+    batch: FetchPartialBucketChecksumByDefinition[]
+  ): Promise<PartialChecksumMap>;
+}
+
+export interface MongoChecksumOptionsV3 extends MongoChecksumOptions {
+  /**
+   * The persisted mapping of the single sync config that reads are served from.
+   *
+   * A thunk rather than a plain value: checksums are constructed eagerly with the storage
+   * instance, but the single-config requirement may only be asserted when a read happens.
+   */
+  syncConfigMapping: () => SingleSyncConfigBucketDefinitionMapping;
+}
+
+export class MongoChecksumsV3 extends MongoChecksums implements DefinitionChecksumOperations {
   declare protected readonly db: VersionedPowerSyncMongoV3;
-  private readonly mapping: BucketDefinitionMapping;
+  private readonly syncConfigMapping: () => SingleSyncConfigBucketDefinitionMapping;
 
-  constructor(db: VersionedPowerSyncMongoV3, group_id: number, options: MongoChecksumOptions) {
+  constructor(db: VersionedPowerSyncMongoV3, group_id: number, options: MongoChecksumOptionsV3) {
     super(db, group_id, options);
-    this.mapping = options.mapping!;
+    this.syncConfigMapping = options.syncConfigMapping;
   }
 
-  private normalizeBatch(batch: FetchPartialBucketChecksum[]): FetchPartialBucketChecksumV3[] {
-    return batch.map((request) => ({
-      bucket: request.bucket,
-      definitionId: this.mapping.bucketSourceId(request.source),
-      start: request.start,
-      end: request.end
-    }));
-  }
-
-  async computePartialChecksumsDirectByDefinition(batch: FetchPartialBucketChecksumV3[]): Promise<PartialChecksumMap> {
+  async computePartialChecksumsDirectByDefinition(
+    batch: FetchPartialBucketChecksumByDefinition[]
+  ): Promise<PartialChecksumMap> {
     const results = new Map<string, PartialOrFullChecksum>();
-    const requestsByDefinition = new Map<string, FetchPartialBucketChecksumV3[]>();
+    const requestsByDefinition = new Map<string, FetchPartialBucketChecksumByDefinition[]>();
 
     for (const request of batch) {
       const existing = requestsByDefinition.get(request.definitionId) ?? [];
@@ -44,10 +67,10 @@ export class MongoChecksumsV3 extends MongoChecksums {
     }
 
     for (const [definitionId, requests] of requestsByDefinition.entries()) {
-      const groupResults = await this.computePartialChecksumsForCollection(
+      const groupResults = await this.computeChecksumsByDefinition(
         requests,
-        this.db.bucketDataV3(this.group_id, definitionId),
-        createV3BucketFilter
+        this.db.bucketData(this.group_id, definitionId),
+        { readOptions: { readConcern: 'snapshot' } }
       );
       for (const checksum of groupResults.values()) {
         results.set(checksum.bucket, checksum);
@@ -60,9 +83,17 @@ export class MongoChecksumsV3 extends MongoChecksums {
   }
 
   protected async fetchPreStates(
-    batch: FetchPartialBucketChecksum[]
+    batch: FetchPartialBucketChecksum[],
+    context: MongoChecksumSessionContext
   ): Promise<Map<string, { opId: InternalOpId; checksum: BucketChecksum }>> {
-    const preFilters = this.normalizeBatch(batch)
+    const normalizedBatch = batch.map((request) => ({
+      bucket: request.bucket,
+      definitionId: this.syncConfigMapping().bucketSourceId(request.source),
+      start: request.start,
+      end: request.end
+    }));
+
+    const preFilters = normalizedBatch
       .filter((request) => request.start == null)
       .map((request) => ({
         _id: {
@@ -78,10 +109,15 @@ export class MongoChecksumsV3 extends MongoChecksums {
     }
 
     const states = await this.db
-      .bucketStateV3(this.group_id)
-      .find({
-        $or: preFilters
-      })
+      .bucketState(this.group_id)
+      .find(
+        {
+          $or: preFilters
+        },
+        {
+          ...context.readOptions
+        }
+      )
       .toArray();
 
     for (const state of states) {
@@ -99,12 +135,191 @@ export class MongoChecksumsV3 extends MongoChecksums {
     return preStates;
   }
 
-  protected async computePartialChecksumsInternal(batch: FetchPartialBucketChecksum[]): Promise<PartialChecksumMap> {
-    return this.computePartialChecksumsDirectByDefinition(this.normalizeBatch(batch));
+  protected async computePartialChecksumsInternal(
+    batch: FetchPartialBucketChecksum[],
+    context: MongoChecksumSessionContext
+  ): Promise<PartialChecksumMap> {
+    const normalized = batch.map((request) => ({
+      bucket: request.bucket,
+      definitionId: this.syncConfigMapping().bucketSourceId(request.source),
+      start: request.start,
+      end: request.end
+    }));
+
+    const results = new Map<string, PartialOrFullChecksum>();
+    const requestsByDefinition = new Map<string, FetchPartialBucketChecksumByDefinition[]>();
+
+    for (const request of normalized) {
+      const existing = requestsByDefinition.get(request.definitionId) ?? [];
+      existing.push(request);
+      requestsByDefinition.set(request.definitionId, existing);
+    }
+
+    for (const [definitionId, requests] of requestsByDefinition.entries()) {
+      const groupResults = await this.computeChecksumsByDefinition(
+        requests,
+        this.db.bucketData(this.group_id, definitionId),
+        context
+      );
+      for (const checksum of groupResults.values()) {
+        results.set(checksum.bucket, checksum);
+      }
+    }
+
+    return new Map<string, PartialOrFullChecksum>(
+      normalized.map((request) => [request.bucket, results.get(request.bucket) ?? emptyChecksumForRequest(request)])
+    );
+  }
+
+  private async computeChecksumsByDefinition(
+    batch: FetchPartialBucketChecksumByBucket[],
+    collection: lib_mongo.mongo.Collection<BucketDataDocumentV3>,
+    context: MongoChecksumSessionContext
+  ): Promise<PartialChecksumMap> {
+    const requests = new Map<string, FetchPartialBucketChecksumByBucket>();
+    for (let request of batch) {
+      requests.set(request.bucket, request);
+    }
+
+    const aggregate = await this.aggregatePartialChecksums(collection, requests, context);
+    const { checksums, startStraddledBuckets } = this.normalizePartialChecksumResults(batch, aggregate);
+
+    if (startStraddledBuckets.size == 0) {
+      return checksums;
+    }
+
+    // A cached base ends inside a compaction-produced document. Its checksum cannot
+    // be safely combined with the document-level checksum, so recalculate this
+    // bucket from the beginning. A full result replaces the cached base upstream.
+    const fullRequests = batch
+      .filter((request) => startStraddledBuckets.has(request.bucket))
+      .map((request) => ({ ...request, start: undefined }));
+    const fullRequestMap = new Map(fullRequests.map((request) => [request.bucket, request]));
+    const fullAggregate = await this.aggregatePartialChecksums(collection, fullRequestMap, context);
+    const fullResults = this.normalizePartialChecksumResults(fullRequests, fullAggregate);
+
+    if (fullResults.startStraddledBuckets.size > 0) {
+      throw new ServiceAssertionError(
+        `Unexpected start-boundary straddle while recalculating bucket(s) ${[...fullResults.startStraddledBuckets].join(', ')}`
+      );
+    }
+    for (const [bucket, checksum] of fullResults.checksums) {
+      checksums.set(bucket, checksum);
+    }
+
+    return checksums;
+  }
+
+  private async aggregatePartialChecksums(
+    collection: lib_mongo.mongo.Collection<BucketDataDocumentV3>,
+    requests: Map<string, FetchPartialBucketChecksumByBucket>,
+    context: MongoChecksumSessionContext
+  ): Promise<bson.Document[]> {
+    return collection
+      .aggregate(this.buildPartialChecksumPipeline(requests), {
+        ...context.readOptions,
+        maxTimeMS: lib_mongo.MONGO_CHECKSUM_TIMEOUT_MS
+      })
+      .toArray()
+      .catch((e) => {
+        throw lib_mongo.mapQueryError(e, 'while reading checksums');
+      });
+  }
+
+  private buildPartialChecksumPipeline(requests: Map<string, FetchPartialBucketChecksumByBucket>): bson.Document[] {
+    const filters = Array.from(requests.values(), createBucketFilter);
+
+    return [
+      // $match with $or filters
+      {
+        $match: {
+          $or: filters
+        }
+      },
+      // Only document-level metadata is used below. Bucket-data operations may
+      // be offloaded, and checksum queries must never inspect the ops array.
+      {
+        $project: {
+          _id: 1,
+          min_op: 1,
+          checksum: 1,
+          count: 1,
+          has_clear_op: 1
+        }
+      },
+      // Aggregate document metadata per bucket. A CLEAR makes the result a full
+      // checksum that replaces any cached prefix; storage guarantees that
+      // documents preceding the CLEAR have already been removed.
+      {
+        $group: {
+          _id: '$_id.b',
+          checksum_total: { $sum: '$checksum' },
+          count: { $sum: '$count' },
+          has_clear_op: {
+            $max: { $cond: ['$has_clear_op', 1, 0] }
+          },
+          min_op: { $min: '$min_op' },
+          max_op: { $max: '$_id.o' }
+        }
+      }
+    ];
+  }
+
+  private normalizePartialChecksumResults(
+    batch: FetchPartialBucketChecksumByBucket[],
+    aggregate: bson.Document[]
+  ): { checksums: PartialChecksumMap; startStraddledBuckets: Set<string> } {
+    const requests = new Map(batch.map((request) => [request.bucket, request]));
+    const startStraddledBuckets = new Set<string>();
+    const partialChecksums = new Map<string, PartialOrFullChecksum>();
+
+    for (const doc of aggregate) {
+      const bucket = doc._id as string;
+      const request = requests.get(bucket)!;
+
+      // A maximum beyond end means a matched document straddles the checkpoint.
+      // Its document-level checksum includes later operations, so this checkpoint
+      // cannot be calculated from document metadata.
+      if (doc.max_op > request.end) {
+        throw new CheckpointChecksumInvalidatedError(request.end, bucket);
+      }
+      // The _id filter excludes documents ending at or before start. A minimum
+      // at or below start therefore means a matched document straddles it.
+      if (request.start != null && doc.min_op <= request.start) {
+        startStraddledBuckets.add(bucket);
+        continue;
+      }
+
+      partialChecksums.set(bucket, checksumFromAggregate(doc));
+    }
+
+    const checksums = new Map<string, PartialOrFullChecksum>(
+      batch.map((request) => {
+        const bucket = request.bucket;
+        let partialChecksum = partialChecksums.get(bucket);
+        if (partialChecksum == null) {
+          partialChecksum = {
+            bucket,
+            partialCount: 0,
+            partialChecksum: 0
+          };
+        }
+        if (request.start == null && isPartialChecksum(partialChecksum)) {
+          partialChecksum = {
+            bucket,
+            count: partialChecksum.partialCount,
+            checksum: partialChecksum.partialChecksum
+          };
+        }
+
+        return [bucket, partialChecksum];
+      })
+    );
+    return { checksums, startStraddledBuckets };
   }
 }
 
-function createV3BucketFilter(request: Pick<FetchPartialBucketChecksumV3, 'bucket' | 'start' | 'end'>) {
+function createBucketFilter(request: Pick<FetchPartialBucketChecksumByBucket, 'bucket' | 'start' | 'end'>) {
   return {
     _id: {
       $gt: {
@@ -113,8 +328,11 @@ function createV3BucketFilter(request: Pick<FetchPartialBucketChecksumV3, 'bucke
       },
       $lte: {
         b: request.bucket,
-        o: request.end
+        o: new bson.MaxKey()
       }
+    },
+    min_op: {
+      $lte: request.end
     }
   };
 }

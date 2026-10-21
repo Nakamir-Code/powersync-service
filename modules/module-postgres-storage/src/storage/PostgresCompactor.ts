@@ -53,6 +53,7 @@ export class PostgresCompactor {
   private clearBatchLimit: number;
   private maxOpId: InternalOpId;
   private buckets: string[] | undefined;
+  private deleteCheckpointRequestsBefore: Date | undefined;
 
   constructor(
     private db: lib_postgres.DatabaseClient,
@@ -65,14 +66,17 @@ export class PostgresCompactor {
     this.clearBatchLimit = options.clearBatchLimit ?? DEFAULT_CLEAR_BATCH_LIMIT;
     this.maxOpId = options.maxOpId ?? 0n;
     this.buckets = options.compactBuckets;
+    this.deleteCheckpointRequestsBefore = options.deleteCheckpointRequestsBefore;
   }
 
   /**
    * Compact buckets by converting operations into MOVE and/or CLEAR operations.
    *
-   * See /docs/compacting-operations.md for details.
+   * See /docs/storage/compacting-operations.md for details.
    */
   async compact() {
+    await this.deleteOldCheckpointRequests();
+
     if (this.buckets) {
       for (let bucket of this.buckets) {
         await this.compactSingleBucket(bucket);
@@ -80,6 +84,26 @@ export class PostgresCompactor {
     } else {
       await this.compactAllBuckets();
     }
+  }
+
+  private async deleteOldCheckpointRequests() {
+    if (this.deleteCheckpointRequestsBefore == null) {
+      return;
+    }
+
+    await this.db.sql`
+      DELETE FROM write_checkpoints
+      WHERE
+        checkpoint_requested_at IS NOT NULL
+        AND checkpoint_requested_at < ${{ type: 1184, value: this.deleteCheckpointRequestsBefore.toISOString() }}
+    `.execute();
+
+    await this.db.sql`
+      DELETE FROM custom_write_checkpoints
+      WHERE
+        checkpoint_requested_at IS NOT NULL
+        AND checkpoint_requested_at < ${{ type: 1184, value: this.deleteCheckpointRequestsBefore.toISOString() }}
+    `.execute();
   }
 
   private async compactAllBuckets() {

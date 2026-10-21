@@ -23,8 +23,6 @@ export class MSSQLModule extends replication.ReplicationModule<types.MSSQLConnec
     });
   }
 
-  async onInitialized(context: system.ServiceContextContainer): Promise<void> {}
-
   protected createRouteAPIAdapter(): api.RouteAPI {
     return new MSSQLRouteAPIAdapter(this.resolveConfig(this.decodedConfig!));
   }
@@ -38,10 +36,12 @@ export class MSSQLModule extends replication.ReplicationModule<types.MSSQLConnec
       id: this.getDefaultId(normalisedConfig.database),
       syncRuleProvider: syncRuleProvider,
       storageEngine: context.storageEngine,
+      configuration: context.configuration,
       metricsEngine: context.metricsEngine,
       connectionFactory: connectionFactory,
       rateLimiter: new MSSQLErrorRateLimiter(),
-      additionalConfig: normalisedConfig.additionalConfig
+      additionalConfig: normalisedConfig.additionalConfig,
+      heartbeatIntervalSeconds: normalisedConfig.heartbeat_interval_seconds
     });
   }
 

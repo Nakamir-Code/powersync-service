@@ -166,16 +166,14 @@ function createFakeStorage(options?: {
     getParsedSyncRules: () => syncRules,
     async getStatus() {
       return {
-        active: true,
-        snapshot_done: options?.snapshotDone ?? false,
-        checkpoint_lsn: options?.snapshotDone ? parseConvexLsn(CURSOR_100) : null,
-        snapshot_lsn: options?.snapshotLsn ?? null
+        snapshotDone: options?.snapshotDone ?? false,
+        resumeLsn: options?.snapshotLsn ?? (options?.snapshotDone ? parseConvexLsn(CURSOR_100) : null)
       };
     }
   };
   Object.assign(storage, {
     clear: vi.fn(async () => undefined),
-    populatePersistentChecksumCache: vi.fn(async () => ({ buckets: 0 })),
+    compactInitialReplication: vi.fn(async () => ({ buckets: 0 })),
     createWriter: vi.fn(async (_options: any) => batch),
     startBatch: vi.fn(async (_options: any, callback: (batch: any) => Promise<void>) => {
       await callback(batch);

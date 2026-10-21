@@ -1,5 +1,272 @@
 # @powersync/service-module-mssql
 
+## 0.10.4
+
+### Patch Changes
+
+- 44ce423: Add `config.source_table_options` to edition 3 sync configs, including MongoDB pre-filtering expressions. Generate editor schemas with examples and report validation errors at their YAML source locations.
+
+  MongoDB replication pre-filtering is not supported in the Open Edition; unsupported configurations report `PSYNC_S1348`. For example:
+
+  ```yaml
+  config:
+    edition: 3
+    source_table_options:
+      orders:
+        mongodb_filter_expression:
+          $and:
+            - $eq: ['$$doc.active', true]
+            - $in: ['$$doc.status', ['pending', 'shipped']]
+  streams:
+    orders:
+      query: SELECT * FROM orders
+  ```
+
+  Validation and deployment reject filters when the feature is unavailable. Parsing accepts an optional map of connection tags to connection types, rejecting MongoDB pre-filtering expressions on known non-MongoDB sources. Unknown connections or missing connection metadata produce advisory warnings. The service supplies connection metadata during validation, deployment, and filesystem loading. Filesystem-loaded sync configs also run source-capability checks. With `exit_on_error` disabled, configs remain available to diagnostics. Changing source-table options requires replacement processing when deploying a new sync config.
+
+  Source capability validation returns structured `ValidationDiagnostic` entries, allowing multiple fatal issues and
+  advisory warnings. Deployment and reprocessing reject fatal diagnostics while validation continues collecting
+  independent findings. Existing `ReplicationError` consumers retain the same diagnostic shape.
+
+- 1decb46: Fix the initial snapshot never completing for SQL Server tables with a composite primary key, or another key type not supported for chunked snapshots, when the table has 10,000 or more rows. The snapshot of these tables now reports progress and can be interrupted between batches.
+- Updated dependencies [44ce423]
+- Updated dependencies [51a1a89]
+- Updated dependencies [e703ca5]
+- Updated dependencies [fff5024]
+- Updated dependencies [324093e]
+- Updated dependencies [286b0f8]
+- Updated dependencies [51a1a89]
+- Updated dependencies [57ef2f4]
+- Updated dependencies [6700c71]
+  - @powersync/service-sync-rules@0.44.0
+  - @powersync/service-core@1.27.1
+  - @powersync/service-types@0.20.0
+  - @powersync/service-errors@0.6.0
+  - @powersync/lib-services-framework@0.10.4
+
+## 0.10.3
+
+### Patch Changes
+
+- Updated dependencies [0483d4e]
+- Updated dependencies [28f024b]
+- Updated dependencies [5078032]
+- Updated dependencies [424bbc0]
+- Updated dependencies [e87703a]
+- Updated dependencies [b70f467]
+- Updated dependencies [18f0c95]
+- Updated dependencies [c60db6e]
+- Updated dependencies [0483d4e]
+- Updated dependencies [a8c3f15]
+  - @powersync/service-core@1.27.0
+  - @powersync/service-types@0.19.0
+  - @powersync/service-sync-rules@0.43.0
+  - @powersync/lib-services-framework@0.10.3
+
+## 0.10.2
+
+### Patch Changes
+
+- Updated dependencies [f842b4e]
+- Updated dependencies [5ae6f75]
+  - @powersync/service-core@1.26.1
+  - @powersync/service-sync-rules@0.42.0
+  - @powersync/lib-services-framework@0.10.2
+
+## 0.10.1
+
+### Patch Changes
+
+- 4e4063b: Optimize runtime type checks, closes https://github.com/powersync-ja/powersync-service/issues/771.
+- 2407f71: Apply timeouts and abortSignal handling to all S3 operations. The broad timeouts can be configured using the new `storage.object_storage.defaults_mode` option, or the `AWS_DEFAULTS_MODE` environment variable. Upgrade S3 SDK to fix further timeout issues.
+- Updated dependencies [e11c54b]
+- Updated dependencies [4b6a23e]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [0077a8d]
+- Updated dependencies [332d649]
+- Updated dependencies [33a3c23]
+- Updated dependencies [fccdff2]
+- Updated dependencies [989d9e1]
+- Updated dependencies [646c0de]
+- Updated dependencies [cc121b3]
+- Updated dependencies [4e4063b]
+- Updated dependencies [2407f71]
+- Updated dependencies [10131ca]
+- Updated dependencies [4037e8f]
+- Updated dependencies [3972bac]
+- Updated dependencies [dd7a22f]
+- Updated dependencies [a997c88]
+  - @powersync/service-core@1.26.0
+  - @powersync/service-sync-rules@0.41.0
+  - @powersync/service-types@0.18.0
+  - @powersync/lib-services-framework@0.10.1
+
+## 0.10.0
+
+### Minor Changes
+
+- 3ca835d: Add custom CA certificate support for MSSQL connections.
+
+  The new `cacert` option allows PowerSync to validate SQL Server certificates issued by a private CA
+  without enabling `trustServerCertificate`. An optional `tls_servername` can be specified when the connection
+  hostname differs from the name in the server certificate.
+
+- 798d739: Pin MSSQL source-table bindings to a specific CDC capture instance.
+
+  A source table now persists the object ID of the CDC change table it replicates from, and restores that
+  binding across restarts, so a stream always replicates the capture schema it started with. Existing
+  bindings without this metadata are backfilled at job startup with the same capture instance the previous
+  streaming logic would have selected.
+
+  SQL Server allows two capture instances per table. When a newer one appears, the current replication
+  process keeps polling the instance it is bound to and warns. Deploy a new sync config to use the newer
+  instance; the active sync config can continue serving clients through the old instance while the new sync
+  config snapshots and catches up. Keep the old instance available until the new sync config becomes active.
+
+  If CDC is disabled for a bound table, or its capture instance is removed while the source table and replica
+  identity remain unchanged, replication stops with `PSYNC_S1601`. A newly configured table that cannot be
+  replicated yet — it does not exist, or CDC has not been enabled for it — stops replication with
+  `PSYNC_S1602` rather than being skipped. Dropping, recreating, or otherwise changing the source identity of
+  a previously bound table stops replication with `PSYNC_S1603`.
+
+- 798d739: [Breaking Change]
+
+  Pin the replicated schema at the start of replication for SQL Server connections.
+
+  SQL Server does not deliver schema changes in the replication stream, so they can only be found by
+  polling, and a poll is never atomic with a commit. That leaves a gap where checkpoints are committed
+  against a schema that has already changed — producing a state the source database was never in, which
+  clients cannot detect. PowerSync therefore no longer adopts schema changes automatically.
+
+  The recommended schema-change workflow treats a sync config deployment as the consistency boundary. A
+  replication stream keeps the exact table set and CDC capture-instance identities it selected when it
+  started; it does not adopt schema or table changes in place. Tables must therefore be listed explicitly
+  rather than selected with wildcards.
+
+  What this means when making schema changes:
+
+  - **Add a table:** create the table, enable CDC, add its exact qualified name to the sync config, and
+    deploy a new sync config. The new sync config snapshots the table before becoming active.
+  - **Change captured columns:** where SQL Server allows a rolling change, apply the DDL and create a second
+    capture instance with the desired captured columns. Update explicit sync queries if needed, deploy a
+    new sync config, wait for its snapshots to finish and for it to become active, and only then remove the
+    old capture instance.
+  - **Make an identity-breaking change:** for a primary-key change, identity-column rename, or another
+    change that requires CDC to be disabled, disable CDC, apply the DDL, re-enable CDC, update the sync
+    config if needed, and deploy a new sync config. The current replication process cannot adopt the
+    replacement in place, so this results in downtime. If it observes CDC being disabled first, it stops
+    with `PSYNC_S1601` because its capture instance was removed. If it next reconciles after the replica
+    identity has changed, it stops with `PSYNC_S1603` instead. Disabling and re-enabling CDC without changing
+    the replica identity stops with `PSYNC_S1601`.
+  - **Drop a table:** remove it from the sync config, deploy a new sync config and wait for it to become
+    active, and only then drop the source table. Dropping the table first stops replication with
+    `PSYNC_S1603`; already-replicated data is retained until the new sync config becomes active.
+  - **Rename or drop/recreate a table:** update the sync config to express the intended table explicitly,
+    ensure the resulting table is CDC-enabled with the expected schema and replica identity, and deploy a
+    new sync config. The current replication process stops with `PSYNC_S1603` if its bound table is removed.
+  - **No deployment is needed** for changes that do not affect the captured row shape or replica identity,
+    such as many index, constraint, or default changes. A non-identity column change also needs no PowerSync
+    action if that changed column does not need to be replicated; otherwise use the rolling capture-instance
+    workflow above.
+
+  This sequencing keeps the old table or capture instance available while the new sync config snapshots and
+  becomes active whenever a rolling transition is possible. If a pinned capture instance or bound table is
+  removed first, the current replication process stops and a new sync config must be deployed.
+
+- 9d0b129: MSSQL CDCPoller improvements and fixes:
+
+  - Ensure correct ordering of CDC results which previously could cause inconsistencies when handling deferred updates
+  - Correctly count processed transactions in each polling cycle
+  - CDC polling query now streams results
+
+### Patch Changes
+
+- Updated dependencies [27b56cb]
+- Updated dependencies [798d739]
+  - @powersync/service-core@1.25.0
+
+## 0.9.0
+
+### Minor Changes
+
+- 087b61e: Configurable heartbeat_interval_seconds for MongoDB, Postgres, SQL Server.
+- 2189250: Add `/sync/checkpoint-request` for client-supplied checkpoint request ids, previously called write checkpoint ids. The route returns the stored `checkpoint_request_id`, storage now treats managed request ids as monotonic per user/client, custom checkpoint request ids continue to use the existing `checkpoint` field for backwards compatibility, and `checkpoint_requested_at` metadata lets compact jobs remove expired request-derived checkpoint records.
+
+  This release includes storage migrations for the checkpoint request metadata. Self-hosters should run migrations as part of the upgrade.
+
+### Patch Changes
+
+- be42e25: Throw a clear error (`PSYNC_R2201`) when a schema wildcard is used in a table pattern with MongoDB, MySQL, SQL Server or Convex connections, instead of silently discovering no tables.
+- Updated dependencies [087b61e]
+- Updated dependencies [2189250]
+- Updated dependencies [922f974]
+- Updated dependencies [c4860c9]
+- Updated dependencies [483415d]
+- Updated dependencies [8daa300]
+- Updated dependencies [aab068b]
+- Updated dependencies [37591e9]
+- Updated dependencies [be42e25]
+- Updated dependencies [be42e25]
+- Updated dependencies [cb4c627]
+  - @powersync/service-core@1.24.0
+  - @powersync/lib-services-framework@0.10.0
+  - @powersync/service-types@0.17.0
+  - @powersync/service-sync-rules@0.40.0
+  - @powersync/service-errors@0.5.0
+
+## 0.8.3
+
+### Patch Changes
+
+- Updated dependencies [ea71bf3]
+- Updated dependencies [ea31f64]
+- Updated dependencies [edc6ed4]
+  - @powersync/service-sync-rules@0.39.0
+  - @powersync/service-core@1.23.3
+  - @powersync/lib-services-framework@0.9.8
+
+## 0.8.2
+
+### Patch Changes
+
+- e4f683d: [MongoDB Storage] Add experimental option to allow reading data from secondaries.
+- Updated dependencies [71d4a0a]
+- Updated dependencies [e4f683d]
+- Updated dependencies [71d4a0a]
+- Updated dependencies [a6ae678]
+- Updated dependencies [c2edf86]
+- Updated dependencies [df9ab1e]
+  - @powersync/service-core@1.23.2
+  - @powersync/service-sync-rules@0.38.1
+  - @powersync/service-types@0.16.1
+  - @powersync/lib-services-framework@0.9.7
+
+## 0.8.1
+
+### Patch Changes
+
+- Updated dependencies [7e65360]
+  - @powersync/service-core@1.23.1
+
+## 0.8.0
+
+### Minor Changes
+
+- a91a08f: [Experimental] Enable incremental reprocessing for MongoDB source + MongoDB storage. This includes significant changes to the v3 storage format.
+
+### Patch Changes
+
+- Updated dependencies [a91a08f]
+- Updated dependencies [184c39f]
+- Updated dependencies [c3f75df]
+- Updated dependencies [4bd35ea]
+  - @powersync/service-core@1.23.0
+  - @powersync/service-types@0.16.0
+  - @powersync/service-errors@0.4.4
+  - @powersync/service-sync-rules@0.38.0
+  - @powersync/lib-services-framework@0.9.6
+
 ## 0.7.0
 
 ### Minor Changes

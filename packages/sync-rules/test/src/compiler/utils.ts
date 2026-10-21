@@ -4,6 +4,7 @@ import {
   getLocation,
   ParsingErrorListener,
   PrecompiledSyncConfig,
+  SerializedSyncPlan,
   serializeSyncPlan,
   SqlSyncRules,
   SyncPlan,
@@ -18,7 +19,7 @@ interface TranslationError {
   startOffset?: number;
 }
 
-export function compileSingleStreamAndSerialize(...sql: string[]): unknown {
+export function compileSingleStreamAndSerialize(...sql: string[]): SerializedSyncPlan {
   const [errors, plan] = compileSingleStream(...sql);
   expect(errors).toStrictEqual([]);
   return serializeSyncPlan(plan);
@@ -68,7 +69,7 @@ function compileSingleStream(...sql: string[]): [TranslationError[], SyncPlan] {
   }
   builder.finish();
 
-  const originalPlan = compiler.output.toSyncPlan();
+  const originalPlan = compiler.toSyncPlan();
   // Add a serialization roundtrip to ensure sync plans are correctly evaluated even after being deserialized.
   const afterSerializationRoundtrip = deserializeSyncPlan(JSON.parse(JSON.stringify(serializeSyncPlan(originalPlan))));
 

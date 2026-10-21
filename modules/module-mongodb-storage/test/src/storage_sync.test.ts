@@ -1,13 +1,25 @@
-import { deserializeParameterLookup, JwtPayload, storage, updateSyncRulesFromYaml } from '@powersync/service-core';
-import { bucketRequest, register, test_utils } from '@powersync/service-core-tests';
-import { DEFAULT_HYDRATION_STATE, nodeSqlite, RequestParameters, SqlSyncRules } from '@powersync/service-sync-rules';
+import { MongoSyncBucketStorageV3 } from '@module/storage/implementation/v3/MongoSyncBucketStorageV3.js';
+import {
+  deserializeParameterLookup,
+  JwtPayload,
+  SingleSyncConfigBucketDefinitionMapping,
+  storage,
+  updateSyncRulesFromYaml
+} from '@powersync/service-core';
+import { bucketRequest, getTestStorage, register, test_utils } from '@powersync/service-core-tests';
+import { RequestParameters, ScopedParameterLookup, SqlSyncRules } from '@powersync/service-sync-rules';
 import * as bson from 'bson';
-import * as sqlite from 'node:sqlite';
 import { describe, expect, test } from 'vitest';
 import { MongoBucketStorage } from '../../src/storage/MongoBucketStorage.js';
+import { MongoParsedSyncConfigSet } from '../../src/storage/implementation/MongoParsedSyncConfigSet.js';
+import { MongoPersistedSyncConfigContentV3 } from '../../src/storage/implementation/MongoPersistedSyncConfigContent.js';
+import { BucketDataDoc, BucketKey } from '../../src/storage/implementation/common/BucketDataDoc.js';
 import { MongoSyncBucketStorage } from '../../src/storage/implementation/createMongoSyncBucketStorage.js';
+import { getMongoStorageConfig } from '../../src/storage/implementation/models.js';
+import { loadBucketDataDocumentV1, serializeBucketDataV1 } from '../../src/storage/implementation/v1/models.js';
 import { SourceRecordStoreV3 } from '../../src/storage/implementation/v3/SourceRecordStoreV3.js';
 import type { VersionedPowerSyncMongoV3 } from '../../src/storage/implementation/v3/VersionedPowerSyncMongoV3.js';
+import { serializeBucketData } from '../../src/storage/implementation/v3/bucket-format.js';
 import {
   CurrentBucketV3,
   ReplicationStreamDocumentV3,
@@ -53,17 +65,116 @@ function objectIdGenerator(id: string) {
   };
 }
 
-function hydratedRulesFor(yaml: string) {
+/**
+ * Build a standalone parsed sync config set for the given yaml, with its own mapping.
+ *
+ * This keeps the sync rules and the bucket definition mapping paired, as required by
+ * `ResolveTablesOptions.parsedSyncConfig`.
+ */
+function parsedSyncConfigSetFor(yaml: string, storageVersion: number) {
   const parsed = SqlSyncRules.fromYaml(yaml, test_utils.PARSE_OPTIONS);
-  expect(parsed.errors).toEqual([]);
-  return parsed.config.hydrate({ hydrationState: DEFAULT_HYDRATION_STATE, sqlite: nodeSqlite(sqlite) });
+  // These fixtures are legacy Sync Rules, which always report a deprecation warning.
+  expect(parsed.errors.filter((error) => error.type !== 'warning')).toEqual([]);
+  return new MongoParsedSyncConfigSet(1, getMongoStorageConfig(storageVersion), 'test_slot', [
+    {
+      syncConfigId: new bson.ObjectId().toHexString(),
+      syncConfig: parsed,
+      mapping: SingleSyncConfigBucketDefinitionMapping.fromParsedSyncConfig(parsed)
+    }
+  ]);
 }
+
+async function getMongoSyncConfigContents(factory: storage.BucketStorageFactory, replicationStreamId: number) {
+  const mongoFactory = factory as MongoBucketStorage;
+  const doc = (await mongoFactory.db.sync_rules.findOne({
+    _id: replicationStreamId
+  })) as ReplicationStreamDocumentV3 | null;
+  if (doc == null) {
+    return [];
+  }
+
+  const db = mongoFactory.db.versioned(getMongoStorageConfig(doc.storage_version)) as VersionedPowerSyncMongoV3;
+  const syncConfigDocs = await db.syncConfigDefinitions
+    .find({
+      _id: { $in: doc.sync_configs.map((config) => config._id) }
+    })
+    .toArray();
+
+  return syncConfigDocs.map((config) => new MongoPersistedSyncConfigContentV3(mongoFactory.db, doc, config));
+}
+
+/**
+ * Get a MongoDB V3 storage bucket definition id, from a bucket name.
+ *
+ * This relies on internals of bucket naming, but helps for simplifying tests.
+ */
+function bucketDefinitionId(bucket: string) {
+  const match = bucket.match(/^\w+\|\w+\.\w+\.(\w+)\[/);
+  if (match == null) {
+    throw new Error(`Expected versioned bucket name, got ${bucket}`);
+  }
+  return parseInt(match[1], 16);
+}
+
+test('V1 bucket data retains an optional persisted subkey', () => {
+  const sourceTable = new bson.ObjectId();
+  const document = serializeBucketDataV1({
+    bucketKey: {
+      replicationStreamId: 1,
+      definitionId: '0',
+      bucket: 'global[]'
+    },
+    o: 1n,
+    op: 'PUT',
+    source_table: sourceTable,
+    source_key: 'source-key',
+    subkey: 'persisted-subkey',
+    table: 'items',
+    row_id: 'item-1',
+    checksum: 1n,
+    data: '{"id":"item-1"}'
+  });
+
+  expect(loadBucketDataDocumentV1(document).subkey).toBe('persisted-subkey');
+
+  const { subkey: _subkey, ...legacyDocument } = document;
+  expect(loadBucketDataDocumentV1(legacyDocument).subkey).toBeUndefined();
+});
 
 function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, storageVersion: number) {
   register.registerSyncTests(storageConfig.factory, {
     storageVersion,
     tableIdStrings: storageConfig.tableIdStrings
   });
+
+  test('updates source metadata on an existing resolved table', async () => {
+    await using factory = await storageConfig.factory();
+    const syncRules = await factory.updateSyncRules(updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, { storageVersion }));
+    const bucketStorage = await getTestStorage(factory, syncRules);
+    await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
+    const source = sourceDescriptor('test');
+
+    const initial = await writer.resolveTables({ connection_id: 1, source });
+    expect(initial.tables[0].sourceMetadata).toBeNull();
+
+    const sourceMetadata = { captureTableObjectId: 42 };
+    const updated = await writer.resolveTables({
+      connection_id: 1,
+      source,
+      reconcileSourceTables: ({ candidates }) => ({
+        compatibleTables: candidates.map((candidate) => candidate.withSourceMetadata(sourceMetadata)),
+        incompatibleTables: [],
+        newTableValues: { sourceMetadata }
+      })
+    });
+
+    expect(updated.tables.map((table) => table.id.toString())).toEqual(
+      initial.tables.map((table) => table.id.toString())
+    );
+    expect(updated.tables[0].sourceMetadata).toEqual(sourceMetadata);
+    expect((await writer.getSourceTableStatus(updated.tables[0]))?.sourceMetadata).toEqual(sourceMetadata);
+  });
+
   // The split of returned results can vary depending on storage drivers
   test('large batch (2)', async () => {
     // Test syncing a batch of data that is small in count,
@@ -81,7 +192,8 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
+    const syncRulesContent = syncRules.syncConfigContent[0];
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
 
@@ -135,8 +247,12 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     const checkpoint = flushResult!.flushed_op;
 
     const options: storage.BucketDataBatchOptions = {};
-    const batch1 = await test_utils.fromAsync(
-      bucketStorage.getBucketDataBatch(checkpoint, [bucketRequest(syncRules, 'global[]', 0n)], options)
+    const batch1 = await test_utils.getBatchArray(
+      bucketStorage.getBucketDataBatch(
+        test_utils.testCheckpoint(checkpoint),
+        [bucketRequest(syncRulesContent, 'global[]', 0n)],
+        options
+      )
     );
     expect(test_utils.getBatchData(batch1)).toEqual([
       { op_id: '1', op: 'PUT', object_id: 'test1', checksum: 2871785649 },
@@ -148,10 +264,10 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
       next_after: '2'
     });
 
-    const batch2 = await test_utils.fromAsync(
+    const batch2 = await test_utils.getBatchArray(
       bucketStorage.getBucketDataBatch(
-        checkpoint,
-        [bucketRequest(syncRules, 'global[]', batch1[0].chunkData.next_after)],
+        test_utils.testCheckpoint(checkpoint),
+        [bucketRequest(syncRulesContent, 'global[]', batch1[0].chunkData.next_after)],
         options
       )
     );
@@ -164,10 +280,10 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
       next_after: '3'
     });
 
-    const batch3 = await test_utils.fromAsync(
+    const batch3 = await test_utils.getBatchArray(
       bucketStorage.getBucketDataBatch(
-        checkpoint,
-        [bucketRequest(syncRules, 'global[]', batch2[0].chunkData.next_after)],
+        test_utils.testCheckpoint(checkpoint),
+        [bucketRequest(syncRulesContent, 'global[]', batch2[0].chunkData.next_after)],
         options
       )
     );
@@ -189,7 +305,10 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
             await Promise.all(
               (
                 await mongoFactory.db.db
-                  .listCollections({ name: new RegExp(`^bucket_data_${syncRules.id}_`) }, { nameOnly: true })
+                  .listCollections(
+                    { name: new RegExp(`^bucket_data_${syncRules.replicationStreamId}_`) },
+                    { nameOnly: true }
+                  )
                   .toArray()
               ).map((collection: { name: string }) =>
                 mongoFactory.db.db
@@ -220,7 +339,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const sourceTable = await test_utils.resolveTestTable(writer, 'test', ['id'], INITIALIZED_MONGO_STORAGE_FACTORY);
@@ -245,7 +364,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const before = await writer.resolveTables({
@@ -283,7 +402,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const before = await writer.resolveTables({
@@ -319,7 +438,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const before = await writer.resolveTables({
@@ -363,7 +482,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
           { storageVersion }
         )
       );
-      const bucketStorage = factory.getInstance(syncRules);
+      const bucketStorage = await getTestStorage(factory, syncRules);
 
       await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
       const resolved = await writer.resolveTables({
@@ -388,8 +507,8 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     }
   );
 
-  test.runIf(storageVersion >= 3)('resolveTables handles v3 source membership additions and removals', async () => {
-    // Tests the behavior of resolveTables when bucket data sources and parameter index creators are added or removed.
+  test.runIf(storageVersion >= 3)('resolveTables handles v3 source membership additions', async () => {
+    // Tests the behavior of resolveTables when bucket data sources and parameter index creators are added.
     // These are not end-to-end tests yet, since we don't have a full incremental reprocessing implementation.
     // This just tests the specific resolveTables behavior.
 
@@ -432,22 +551,22 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     // Here we're persisting one sync config, then resolving tables with others.
     // We're also using the default hydration state for them all.
     const syncRules = await factory.updateSyncRules(updateSyncRulesFromYaml(fullRulesYaml, { storageVersion }));
-    const bucketStorage = factory.getInstance(syncRules) as MongoSyncBucketStorage;
+    const bucketStorage = (await getTestStorage(factory, syncRules)) as MongoSyncBucketStorage;
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
-    const fullRules = hydratedRulesFor(fullRulesYaml);
-    const dataOnlyRules = hydratedRulesFor(dataOnlyRulesYaml);
-    const parameterOnlyRules = hydratedRulesFor(parameterOnlyRulesYaml);
-    const eventOnlyRules = hydratedRulesFor(eventOnlyRulesYaml);
+    const fullRules = parsedSyncConfigSetFor(fullRulesYaml, storageVersion);
+    const dataOnlyRules = parsedSyncConfigSetFor(dataOnlyRulesYaml, storageVersion);
+    const parameterOnlyRules = parsedSyncConfigSetFor(parameterOnlyRulesYaml, storageVersion);
+    const eventOnlyRules = parsedSyncConfigSetFor(eventOnlyRulesYaml, storageVersion);
     const source = sourceDescriptor('memberships', { objectId: 'memberships-relation' });
     const dataOnlyTableId = new bson.ObjectId('6544e3899293153fa7b38348');
     const addedParameterTableId = new bson.ObjectId('6544e3899293153fa7b38349');
-    const removedDataTableId = new bson.ObjectId('6544e3899293153fa7b3834a');
+    const addedEventTableId = new bson.ObjectId('6544e3899293153fa7b3834a');
 
     const dataOnly = await writer.resolveTables({
       connection_id: 1,
       source,
       idGenerator: () => dataOnlyTableId,
-      syncRules: dataOnlyRules
+      parsedSyncConfig: dataOnlyRules
     });
     expect(dataOnly.tables.map((table) => table.id)).toEqual([dataOnlyTableId]);
     expect(dataOnly.dropTables.map((table) => table.id)).toEqual([]);
@@ -458,7 +577,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
       connection_id: 1,
       source,
       idGenerator: () => addedParameterTableId,
-      syncRules: fullRules
+      parsedSyncConfig: fullRules
     });
     // Adding a definition always creates a new SourceTable
     expect(addedParameter.tables.map((table) => table.id)).toEqual([dataOnlyTableId, addedParameterTableId]);
@@ -472,47 +591,274 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
       idGenerator: () => {
         throw new Error('data-only resolve should reuse existing v3 source table');
       },
-      syncRules: dataOnlyRules
+      parsedSyncConfig: dataOnlyRules
     });
     expect(removedParameter.tables.map((table) => table.id)).toEqual([dataOnlyTableId]);
-    // Now this sourceTable is unused & dropped
-    expect(removedParameter.dropTables.map((table) => table.id)).toEqual([addedParameterTableId]);
+    // Same-identity tables that no longer cover desired memberships are left in place.
+    expect(removedParameter.dropTables.map((table) => table.id)).toEqual([]);
     expect(removedParameter.tables[0].bucketDataSources).toHaveLength(1);
     expect(removedParameter.tables[0].parameterLookupSources).toHaveLength(0);
-    await writer.drop(removedParameter.dropTables);
 
     const removedData = await writer.resolveTables({
       connection_id: 1,
       source,
-      idGenerator: () => removedDataTableId,
-      syncRules: parameterOnlyRules
+      idGenerator: () => {
+        throw new Error('parameter-only resolve should reuse existing v3 source table');
+      },
+      parsedSyncConfig: parameterOnlyRules
     });
 
-    // This goes from dataOnlyRules -> parameterOnlyRules, which adds one definition and removes another.
-    // This generates a new SourceTable again, and removes all others.
-    expect(removedData.tables.map((table) => table.id)).toEqual([removedDataTableId]);
-    expect(removedData.dropTables.map((table) => table.id)).toEqual([dataOnlyTableId]);
+    // This goes from dataOnlyRules -> parameterOnlyRules, which removes one definition but
+    // reuses the existing parameter-only source table.
+    expect(removedData.tables.map((table) => table.id)).toEqual([addedParameterTableId]);
+    expect(removedData.dropTables.map((table) => table.id)).toEqual([]);
     expect(removedData.tables[0].bucketDataSources).toHaveLength(0);
     expect(removedData.tables[0].parameterLookupSources).toHaveLength(1);
-    await writer.drop(removedData.dropTables);
 
     const eventOnly = await writer.resolveTables({
       connection_id: 1,
       source,
-      idGenerator: () => {
-        throw new Error('resolve should reuse existing v3 source table');
-      },
-      syncRules: eventOnlyRules
+      idGenerator: () => addedEventTableId,
+      parsedSyncConfig: eventOnlyRules
     });
 
-    // Event-only table can re-use any existing table.
-    expect(eventOnly.tables.map((table) => table.id)).toEqual([removedDataTableId]);
+    // A newly-added event gets its own source table so that its existing rows are snapshotted.
+    expect(eventOnly.tables).toHaveLength(1);
+    expect(eventOnly.tables[0].id).toEqual(addedEventTableId);
     expect(eventOnly.dropTables.map((table) => table.id)).toEqual([]);
     expect(eventOnly.tables[0].bucketDataSources).toHaveLength(0);
     expect(eventOnly.tables[0].parameterLookupSources).toHaveLength(0);
     expect(eventOnly.tables[0].syncData).toBe(false);
     expect(eventOnly.tables[0].syncParameters).toBe(false);
     expect(eventOnly.tables[0].syncEvent).toBe(true);
+  });
+
+  test.runIf(storageVersion >= 3)('resolveTables assigns an event definition to one split source table', async () => {
+    // When memberships are split over multiple SourceTables for the same ref, a row change
+    // is saved once per table. Each event-definition id must belong to only one of those tables,
+    // otherwise that definition would be evaluated more than once for the same row change.
+    // Other tables may independently own and evaluate different event definitions.
+    const dataOnlyEventYaml = `
+    bucket_definitions:
+      by_owner:
+        parameters:
+          - SELECT token_parameters.owner_id as owner_id
+        data:
+          - SELECT id, owner_id FROM memberships WHERE owner_id = bucket.owner_id
+
+    event_definitions:
+      write_checkpoints:
+        payloads:
+          - SELECT id, owner_id FROM memberships
+    `;
+    const fullEventYaml = `
+    bucket_definitions:
+      by_owner:
+        parameters:
+          - SELECT owner_id FROM memberships WHERE id = token_parameters.test_id
+        data:
+          - SELECT id, owner_id FROM memberships WHERE owner_id = bucket.owner_id
+
+    event_definitions:
+      write_checkpoints:
+        payloads:
+          - SELECT id, owner_id FROM memberships
+    `;
+
+    await using factory = await storageConfig.factory();
+    const syncRules = await factory.updateSyncRules(updateSyncRulesFromYaml(dataOnlyEventYaml, { storageVersion }));
+    const bucketStorage = (await getTestStorage(factory, syncRules)) as MongoSyncBucketStorage;
+    await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
+    const dataOnlyRules = parsedSyncConfigSetFor(dataOnlyEventYaml, storageVersion);
+    const fullRules = parsedSyncConfigSetFor(fullEventYaml, storageVersion);
+    const source = sourceDescriptor('memberships', { objectId: 'memberships-relation' });
+
+    const initial = await writer.resolveTables({
+      connection_id: 1,
+      source,
+      idGenerator: objectIdGenerator('6544e3899293153fa7b3834b'),
+      parsedSyncConfig: dataOnlyRules
+    });
+    expect(initial.tables).toHaveLength(1);
+    expect(initial.tables[0].syncEvent).toBe(true);
+
+    // Adding the table-based parameter lookup creates a second SourceTable for the same ref.
+    const split = await writer.resolveTables({
+      connection_id: 1,
+      source,
+      idGenerator: objectIdGenerator('6544e3899293153fa7b3834c'),
+      parsedSyncConfig: fullRules
+    });
+    expect(split.tables).toHaveLength(2);
+    // Both tables match the event by ref, but this event id belongs to only one of them.
+    const eventOwners = split.tables.filter((table) => table.syncEvent);
+    expect(eventOwners).toHaveLength(1);
+
+    // getSourceTableStatus rehydrates the persisted event memberships rather than recomputing
+    // them from the ref, so refreshing the other table does not assign this event to it.
+    const nonOwner = split.tables.find((table) => !table.syncEvent)!;
+    const refreshed = await writer.getSourceTableStatus(nonOwner);
+    expect(refreshed!.syncEvent).toBe(false);
+  });
+
+  test.runIf(storageVersion >= 3)(
+    'reuses an unchanged event definition without resnapshotting or duplicate evaluation',
+    async () => {
+      const firstYaml = `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+
+event_definitions:
+  write_checkpoints:
+    payloads:
+      - SELECT user_id, checkpoint FROM checkpoints WHERE active = true AND checkpoint > 0
+`;
+      const secondYaml = `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+  by_project:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+
+event_definitions:
+  write_checkpoints:
+    payloads:
+      - select "user_id", "checkpoint" from "checkpoints" where "active" = true and "checkpoint" > 0
+`;
+
+      await using factory = await storageConfig.factory();
+      const emittedEvents: { name: string; eventId: string | undefined }[] = [];
+      const disposeListener = factory.registerListener({
+        replicationEvent: ({ event, event_id }) => emittedEvents.push({ name: event.name, eventId: event_id })
+      });
+      try {
+        const first = await factory.updateSyncRules(updateSyncRulesFromYaml(firstYaml, { storageVersion }));
+        const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+        await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+        const source = sourceDescriptor('checkpoints', { objectId: 'checkpoints-relation' });
+        const firstResolved = await firstWriter.resolveTables({
+          connection_id: 1,
+          source,
+          idGenerator: objectIdGenerator('6544e3899293153fa7b38351')
+        });
+        const eventId = [...firstResolved.tables[0].eventDefinitionIds!][0];
+        expect(eventId).toBeDefined();
+        await firstWriter.markTableSnapshotDone(firstResolved.tables, '1/1');
+        await firstWriter.markAllSnapshotDone('1/1');
+        await firstWriter.commit('1/1');
+
+        const second = await factory.updateSyncRules(updateSyncRulesFromYaml(secondYaml, { storageVersion }));
+        expect(second.replicationStreamId).toBe(first.replicationStreamId);
+        const secondStorage = (await getTestStorage(factory, second)) as MongoSyncBucketStorage;
+        await using secondWriter = await secondStorage.createWriter(test_utils.BATCH_OPTIONS);
+        const resolved = await secondWriter.resolveTables({
+          connection_id: 1,
+          source,
+          idGenerator: () => {
+            throw new Error('unchanged event definition should reuse the snapshotted source table');
+          }
+        });
+
+        expect(resolved.tables).toHaveLength(1);
+        expect(resolved.tables[0].id).toEqual(firstResolved.tables[0].id);
+        expect(resolved.tables[0].snapshotComplete).toBe(true);
+        expect([...resolved.tables[0].eventDefinitionIds!]).toEqual([eventId]);
+
+        emittedEvents.length = 0;
+        await secondWriter.save({
+          sourceTable: resolved.tables[0],
+          tag: storage.SaveOperationTag.INSERT,
+          after: { id: 'checkpoint-1', user_id: 'user-1', checkpoint: 1n, active: 1 },
+          afterReplicaId: test_utils.rid('checkpoint-1')
+        });
+        expect(emittedEvents).toEqual([{ name: 'write_checkpoints', eventId }]);
+      } finally {
+        disposeListener();
+      }
+    }
+  );
+
+  test.runIf(storageVersion >= 3)('creates snapshot work for a changed event definition', async () => {
+    const yaml = (active: boolean) => `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+
+event_definitions:
+  write_checkpoints:
+    payloads:
+      - SELECT user_id, checkpoint FROM checkpoints WHERE active = ${active}
+`;
+
+    await using factory = await storageConfig.factory();
+    const emittedEvents: { name: string; eventId: string | undefined }[] = [];
+    const disposeListener = factory.registerListener({
+      replicationEvent: ({ event, event_id }) => emittedEvents.push({ name: event.name, eventId: event_id })
+    });
+    try {
+      const first = await factory.updateSyncRules(updateSyncRulesFromYaml(yaml(true), { storageVersion }));
+      const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+      await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+      const source = sourceDescriptor('checkpoints', { objectId: 'checkpoints-relation' });
+      const firstResolved = await firstWriter.resolveTables({
+        connection_id: 1,
+        source,
+        idGenerator: objectIdGenerator('6544e3899293153fa7b38352')
+      });
+      const oldEventId = [...firstResolved.tables[0].eventDefinitionIds!][0];
+      await firstWriter.markTableSnapshotDone(firstResolved.tables, '1/1');
+      await firstWriter.markAllSnapshotDone('1/1');
+      await firstWriter.commit('1/1');
+
+      const second = await factory.updateSyncRules(updateSyncRulesFromYaml(yaml(false), { storageVersion }));
+      expect(second.replicationStreamId).toBe(first.replicationStreamId);
+      const secondStorage = (await getTestStorage(factory, second)) as MongoSyncBucketStorage;
+      await using secondWriter = await secondStorage.createWriter(test_utils.BATCH_OPTIONS);
+      const resolved = await secondWriter.resolveTables({
+        connection_id: 1,
+        source,
+        idGenerator: objectIdGenerator('6544e3899293153fa7b38353')
+      });
+
+      expect(resolved.tables).toHaveLength(2);
+      const oldTable = resolved.tables.find((table) => table.eventDefinitionIds?.has(oldEventId))!;
+      const newTable = resolved.tables.find((table) => !table.eventDefinitionIds?.has(oldEventId))!;
+      const newEventId = [...newTable.eventDefinitionIds!][0];
+      expect(newEventId).toBeDefined();
+      expect(newEventId).not.toBe(oldEventId);
+      expect(oldTable.snapshotComplete).toBe(true);
+      expect(newTable.snapshotComplete).toBe(false);
+      expect(newTable.bucketDataSources).toEqual([]);
+      expect(newTable.parameterLookupSources).toEqual([]);
+
+      await expect(secondWriter.markSnapshotDone('2/1')).rejects.toThrow(
+        'Cannot mark snapshot done while source tables still require snapshotting'
+      );
+
+      emittedEvents.length = 0;
+      await secondWriter.save({
+        sourceTable: newTable,
+        tag: storage.SaveOperationTag.INSERT,
+        after: { id: 'checkpoint-2', user_id: 'user-2', checkpoint: 2n, active: 0 },
+        afterReplicaId: test_utils.rid('checkpoint-2')
+      });
+      expect(emittedEvents).toEqual([{ name: 'write_checkpoints', eventId: newEventId }]);
+
+      await secondWriter.markTableSnapshotDone([newTable], '2/1');
+      await secondWriter.markSnapshotDone('2/1');
+    } finally {
+      disposeListener();
+    }
   });
 
   test.runIf(storageVersion >= 3)('uses v3 mongodb model shapes', async () => {
@@ -530,8 +876,9 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
-    const sync_rules = syncRules.parsed(test_utils.PARSE_OPTIONS).hydratedSyncConfig();
+    const bucketStorage = await getTestStorage(factory, syncRules);
+    const syncRulesContent = syncRules.syncConfigContent[0];
+    const sync_rules = syncRulesContent.parsed(test_utils.PARSE_OPTIONS).hydratedSyncConfig;
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const sourceTable = await test_utils.resolveTestTable(writer, 'test', ['id'], INITIALIZED_MONGO_STORAGE_FACTORY);
 
@@ -552,7 +899,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     const parameters = new RequestParameters(new JwtPayload({ sub: 'u1', parameters: { test: 'shape-check' } }), {});
     const querier = sync_rules.getBucketParameterQuerier(test_utils.querierOptions(parameters)).querier;
     const buckets = await querier.queryDynamicBucketDescriptions({
-      async getParameterSets(lookups) {
+      async getParameterSets(lookups: ScopedParameterLookup[]) {
         expect(lookups.map((l) => l.indexKey)).toEqual([['shape-check']]);
         expect(lookups[0].indexId).toEqual('1');
 
@@ -561,31 +908,733 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         return parameter_sets;
       }
     });
-    expect(buckets.map((b) => b.bucket)).toEqual([bucketRequest(syncRules, 'global["user-1"]').bucket]);
+    expect(buckets.map((b) => b.bucket)).toEqual([bucketRequest(syncRulesContent, 'global["user-1"]').bucket]);
 
     const mongoFactory = factory as MongoBucketStorage;
     const db = (bucketStorage as MongoSyncBucketStorage).db as VersionedPowerSyncMongoV3;
-    const currentDataCollections = await db.listSourceRecordCollectionsV3(syncRules.id);
+    const currentDataCollections = await db.listSourceRecordCollections(syncRules.replicationStreamId);
     const currentData = await currentDataCollections[0]?.findOne({});
     const firstBucket: CurrentBucketV3 | undefined = currentData?.buckets[0] as CurrentBucketV3 | undefined;
     expect(firstBucket?.def).toMatch(/^[0-9a-f]+$/);
 
     const bucketCollections = await mongoFactory.db.db
-      .listCollections({ name: new RegExp(`^bucket_data_${syncRules.id}_`) }, { nameOnly: true })
+      .listCollections({ name: new RegExp(`^bucket_data_${syncRules.replicationStreamId}_`) }, { nameOnly: true })
       .toArray();
     expect(
-      bucketCollections.some((collection) => collection.name === `bucket_data_${syncRules.id}_${firstBucket?.def}`)
+      bucketCollections.some(
+        (collection) => collection.name === `bucket_data_${syncRules.replicationStreamId}_${firstBucket?.def}`
+      )
     ).toBe(true);
 
-    const syncRule = (await mongoFactory.db.sync_rules.findOne({ _id: syncRules.id })) as ReplicationStreamDocumentV3;
+    const syncRule = (await mongoFactory.db.sync_rules.findOne({
+      _id: syncRules.replicationStreamId
+    })) as ReplicationStreamDocumentV3;
     const syncConfig = await db.syncConfigDefinitions.findOne({ _id: syncRule.sync_configs[0]._id });
     const ruleMapping: SyncConfigDefinition['rule_mapping'] | undefined = syncConfig?.rule_mapping;
     expect(Object.keys(ruleMapping?.definitions ?? {})).not.toHaveLength(0);
 
     const parameterIndexId = Object.values(ruleMapping?.parameter_indexes ?? {})[0] as string | undefined;
     expect(parameterIndexId).toBeDefined();
-    const parameterEntry = await db.parameterIndexV3(syncRules.id, parameterIndexId!).findOne({});
+    const parameterEntry = await db.parameterIndex(syncRules.replicationStreamId, parameterIndexId!).findOne({});
     expect(deserializeParameterLookup(parameterEntry!.lookup)).toEqual(['shape-check']);
+  });
+
+  test.runIf(storageVersion >= 3)('replaces an existing deploying sync config', async () => {
+    await using factory = await storageConfig.factory();
+
+    const first = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 2
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+        { storageVersion }
+      )
+    );
+    const second = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 2
+
+streams:
+  by_project:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+`,
+        { storageVersion }
+      )
+    );
+
+    expect(second.replicationStreamId).not.toEqual(first.replicationStreamId);
+    expect(
+      (await factory.getStoppedReplicationStreams()).find(
+        (stream) => stream.replicationStreamId == first.replicationStreamId
+      )?.state
+    ).toBe(storage.SyncRuleState.STOP);
+
+    const replicatingStreams = await factory.getReplicatingReplicationStreams();
+    expect(replicatingStreams).toHaveLength(1);
+    expect(replicatingStreams[0].replicationStreamId).toEqual(second.replicationStreamId);
+
+    const configs = second.syncConfigContent;
+    expect(configs).toHaveLength(1);
+    const statuses = await Promise.all(configs.map((config) => config.getSyncConfigStatus()));
+    expect(statuses.map((status) => status?.state)).toEqual([storage.SyncRuleState.PROCESSING]);
+    expect(statuses.map((status) => status?.id)).toEqual(configs.map((config) => config.syncConfigId));
+    const parsed = replicatingStreams[0].parsed(test_utils.PARSE_OPTIONS);
+    expect(parsed.syncConfigs).toHaveLength(1);
+    expect(parsed.hydratedSyncConfig.bucketDataSources).toHaveLength(1);
+
+    const bucketStorage = await getTestStorage(factory, replicatingStreams[0]);
+    await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
+    const resolved = await writer.resolveTables({
+      connection_id: 1,
+      source: sourceDescriptor('todos', { objectId: 'todos-relation' }),
+      idGenerator: objectIdGenerator('6544e3899293153fa7b3834b')
+    });
+    expect(resolved.tables).toHaveLength(1);
+    expect(resolved.tables[0].bucketDataSources).toHaveLength(1);
+  });
+
+  test.runIf(storageVersion >= 3)('removing one config keeps shared source-table membership', async () => {
+    await using factory = await storageConfig.factory();
+
+    const first = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+        { storageVersion }
+      )
+    );
+    const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+    await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+    await firstWriter.markAllSnapshotDone('1/1');
+    await firstWriter.commit('1/1');
+
+    const second = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 3
+
+streams:
+  by_project:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+`,
+        { storageVersion }
+      )
+    );
+    expect(second.replicationStreamId).toEqual(first.replicationStreamId);
+
+    const bucketStorage = await getTestStorage(factory, second);
+    await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
+    const source = sourceDescriptor('todos', { objectId: 'todos-relation' });
+
+    const resolved = await writer.resolveTables({
+      connection_id: 1,
+      source,
+      idGenerator: objectIdGenerator('6544e3899293153fa7b3834c')
+    });
+    expect(resolved.tables).toHaveLength(1);
+    expect(resolved.tables[0].bucketDataSources).toHaveLength(2);
+
+    await writer.markAllSnapshotDone('2/1');
+    await writer.commit('2/1');
+
+    const activeStorage = (await getTestStorage(
+      factory,
+      (await factory.getActiveSyncConfig())!.replicationStream
+    )) as MongoSyncBucketStorage;
+    await using activeWriter = await activeStorage.createWriter(test_utils.BATCH_OPTIONS);
+    const activeStatus = await activeWriter.getSourceTableStatus(resolved.tables[0]);
+    expect(activeStatus?.bucketDataSources).toHaveLength(1);
+  });
+
+  test.runIf(storageVersion >= 3)(
+    'editing a stream query on the same table does not drop the active source table',
+    async () => {
+      await using factory = await storageConfig.factory();
+
+      const first = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(
+          `
+config:
+  edition: 3
+
+streams:
+  todos:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+          { storageVersion }
+        )
+      );
+      const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+      await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+      const source = sourceDescriptor('todos', { objectId: 'todos-relation' });
+      const firstResolved = await firstWriter.resolveTables({
+        connection_id: 1,
+        source,
+        idGenerator: objectIdGenerator('6544e3899293153fa7b3834d')
+      });
+      expect(firstResolved.dropTables).toHaveLength(0);
+      await firstWriter.markAllSnapshotDone('1/1');
+      await firstWriter.commit('1/1');
+
+      const second = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(
+          `
+config:
+  edition: 3
+
+streams:
+  todos:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+`,
+          { storageVersion }
+        )
+      );
+      expect(second.replicationStreamId).toBe(first.replicationStreamId);
+
+      const deploying = await factory.getDeployingSyncConfig();
+      expect(deploying?.replicationStream.replicationStreamId).toBe(first.replicationStreamId);
+      const bucketStorage = await getTestStorage(factory, deploying!.replicationStream);
+      await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
+      const resolved = await writer.resolveTables({
+        connection_id: 1,
+        source,
+        idGenerator: objectIdGenerator('6544e3899293153fa7b3834e')
+      });
+
+      expect(resolved.dropTables).toHaveLength(0);
+      expect(resolved.tables.map((table) => table.id.toString())).toEqual(['6544e3899293153fa7b3834e']);
+      expect(resolved.tables[0].bucketDataSources).toHaveLength(1);
+
+      const activeStatus = await firstWriter.getSourceTableStatus(firstResolved.tables[0]);
+      expect(activeStatus?.bucketDataSources).toHaveLength(1);
+    }
+  );
+
+  test.runIf(storageVersion >= 3)('reserves historical mapping ids without reusing stopped configs', async () => {
+    await using factory = await storageConfig.factory();
+
+    const ownerRules = `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`;
+    const projectRules = `
+config:
+  edition: 3
+
+streams:
+  by_project:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+`;
+    const statusRules = `
+config:
+  edition: 3
+
+streams:
+  by_status:
+    query: SELECT * FROM todos WHERE status = subscription.parameter('status')
+`;
+
+    const first = await factory.updateSyncRules(updateSyncRulesFromYaml(ownerRules, { storageVersion }));
+    const firstStorage = await getTestStorage(factory, first);
+    await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+    await firstWriter.markAllSnapshotDone('1/1');
+    await firstWriter.commit('1/1');
+
+    const second = await factory.updateSyncRules(updateSyncRulesFromYaml(projectRules, { storageVersion }));
+    expect(second.replicationStreamId).toBe(first.replicationStreamId);
+
+    const third = await factory.updateSyncRules(updateSyncRulesFromYaml(statusRules, { storageVersion }));
+    expect(third.replicationStreamId).toBe(first.replicationStreamId);
+
+    const configs = await getMongoSyncConfigContents(factory, first.replicationStreamId);
+    const statuses = await Promise.all(
+      configs.map(async (config) => [config, await config.getSyncConfigStatus()] as const)
+    );
+    // ownerRules
+    const activeConfig = statuses.find(([, status]) => status?.state == storage.SyncRuleState.ACTIVE)?.[0];
+    // projectRules
+    const stoppedConfig = statuses.find(([, status]) => status?.state == storage.SyncRuleState.STOP)?.[0];
+    // statusRules
+    const processingConfig = statuses.find(([, status]) => status?.state == storage.SyncRuleState.PROCESSING)?.[0];
+    expect(stoppedConfig).toBeDefined();
+    expect(activeConfig).toBeDefined();
+    expect(processingConfig).toBeDefined();
+
+    const activePrefix = bucketRequest(activeConfig!, 'by_owner|0["owner"]').bucket;
+    const stoppedPrefix = bucketRequest(stoppedConfig!, 'by_project|0["project"]').bucket;
+    const processingPrefix = bucketRequest(processingConfig!, 'by_status|0["status"]').bucket;
+
+    expect(processingPrefix).not.toBe(stoppedPrefix);
+    expect(processingPrefix).not.toBe(activePrefix);
+    expect(bucketDefinitionId(processingPrefix)).toBeGreaterThan(
+      Math.max(bucketDefinitionId(stoppedPrefix), bucketDefinitionId(activePrefix))
+    );
+  });
+
+  test.runIf(storageVersion >= 3)('table snapshot status only affects sync configs using that table', async () => {
+    await using factory = await storageConfig.factory();
+
+    const first = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+        { storageVersion }
+      )
+    );
+    const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+    await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+    await firstWriter.markAllSnapshotDone('1/1');
+    await firstWriter.commit('1/1');
+
+    const second = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+  by_project:
+    query: SELECT * FROM projects WHERE id = subscription.parameter('project_id')
+`,
+        { storageVersion }
+      )
+    );
+    expect(second.replicationStreamId).toBe(first.replicationStreamId);
+
+    const bucketStorage = await getTestStorage(factory, second);
+    await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
+    const resolved = await writer.resolveTables({
+      connection_id: 1,
+      source: sourceDescriptor('projects', { objectId: 'projects-relation' }),
+      idGenerator: objectIdGenerator('6544e3899293153fa7b3834d')
+    });
+    expect(resolved.tables).toHaveLength(1);
+
+    await writer.markAllSnapshotDone('2/1');
+    await writer.markTableSnapshotRequired(resolved.tables[0]);
+
+    const configsAfterRequired = await getMongoSyncConfigContents(factory, first.replicationStreamId);
+    const statusesAfterRequired = await Promise.all(configsAfterRequired.map((config) => config.getSyncConfigStatus()));
+    const ownerConfigAfterRequired = statusesAfterRequired.find(
+      (status) => status?.state == storage.SyncRuleState.ACTIVE
+    );
+    const projectConfigAfterRequired = statusesAfterRequired.find(
+      (status) => status?.state == storage.SyncRuleState.PROCESSING
+    );
+    expect(ownerConfigAfterRequired?.snapshot_done).toBe(true);
+    expect(projectConfigAfterRequired?.snapshot_done).toBe(false);
+
+    await writer.markTableSnapshotDone(resolved.tables, '3/1');
+
+    const configsAfterDone = await getMongoSyncConfigContents(factory, first.replicationStreamId);
+    const statusesAfterDone = await Promise.all(configsAfterDone.map((config) => config.getSyncConfigStatus()));
+    const ownerConfigAfterDone = statusesAfterDone.find((status) => status?.id == ownerConfigAfterRequired!.id);
+    const projectConfigAfterDone = statusesAfterDone.find((status) => status?.id == projectConfigAfterRequired!.id);
+    expect(ownerConfigAfterDone?.snapshot_done).toBe(true);
+    expect(projectConfigAfterDone?.snapshot_done).toBe(false);
+  });
+
+  test.runIf(storageVersion >= 3)(
+    'keeps compatible active and deploying sync configs in one replication stream',
+    async () => {
+      await using factory = await storageConfig.factory();
+
+      const first = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(
+          `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+          { storageVersion }
+        )
+      );
+      const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+      await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+      await firstWriter.markAllSnapshotDone('1/1');
+      await firstWriter.commit('1/1');
+      const initialActiveStorage = (await factory.getActiveSyncConfig())?.storage as MongoSyncBucketStorage;
+
+      let configs = first.syncConfigContent;
+      const firstConfigId = configs[0].syncConfigId;
+      expect((await factory.getActiveSyncConfig())?.content.syncConfigId).toBe(firstConfigId);
+
+      const second = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(
+          `
+config:
+  edition: 3
+
+streams:
+  by_project:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+`,
+          { storageVersion }
+        )
+      );
+      expect(second.replicationStreamId).toEqual(first.replicationStreamId);
+
+      configs = await getMongoSyncConfigContents(factory, first.replicationStreamId);
+      const deploying = await factory.getDeployingSyncConfig();
+      expect(configs).toHaveLength(2);
+      expect(deploying).not.toBeNull();
+      expect((await factory.getActiveSyncConfig())?.content.syncConfigId).toBe(firstConfigId);
+
+      const stream = (await factory.getActiveSyncConfig())?.replicationStream;
+      expect(stream?.state).toBe(storage.SyncRuleState.ACTIVE);
+      expect(
+        (await Promise.all(configs.map((config) => config.getSyncConfigStatus()))).map((status) => status?.state).sort()
+      ).toEqual([storage.SyncRuleState.ACTIVE, storage.SyncRuleState.PROCESSING]);
+
+      const replicatingStreams = await factory.getReplicatingReplicationStreams();
+      expect(replicatingStreams).toHaveLength(1);
+      for (const config of configs) {
+        expect(replicatingStreams[0].replicationJobId).toContain(config.syncConfigId);
+      }
+
+      const secondStorage = (await getTestStorage(factory, replicatingStreams[0])) as MongoSyncBucketStorage;
+      await using secondWriter = await secondStorage.createWriter(test_utils.BATCH_OPTIONS);
+      await secondWriter.markAllSnapshotDone('2/1');
+      await secondWriter.commit('2/1');
+
+      const updatedStream = (await factory.getActiveSyncConfig())?.replicationStream;
+      expect(updatedStream?.state).toBe(storage.SyncRuleState.ACTIVE);
+      const updatedConfigs = await getMongoSyncConfigContents(factory, first.replicationStreamId);
+      expect(
+        (await Promise.all(updatedConfigs.map((config) => config.getSyncConfigStatus())))
+          .map((status) => status?.state)
+          .sort()
+      ).toEqual([storage.SyncRuleState.ACTIVE, storage.SyncRuleState.STOP]);
+      expect(await factory.getDeployingSyncConfig()).toBeNull();
+      expect((await factory.getActiveSyncConfig())?.content.syncConfigId).not.toBe(firstConfigId);
+      const updatedActiveStorage = (await factory.getActiveSyncConfig())?.storage as MongoSyncBucketStorage;
+      expect(updatedActiveStorage.replicationStream.replicationJobId).not.toBe(
+        initialActiveStorage.replicationStream.replicationJobId
+      );
+      expect(updatedActiveStorage.replicationStream.replicationJobId).toContain(
+        (await factory.getActiveSyncConfig())!.content.syncConfigId
+      );
+    }
+  );
+
+  test.runIf(storageVersion >= 3)(
+    'restart creates a replacement stream instead of appending to the active stream',
+    async () => {
+      await using factory = await storageConfig.factory();
+
+      const active = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(
+          `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+          { storageVersion }
+        )
+      );
+      const activeStorage = (await getTestStorage(factory, active)) as MongoSyncBucketStorage;
+      await using activeWriter = await activeStorage.createWriter(test_utils.BATCH_OPTIONS);
+      await activeWriter.markAllSnapshotDone('1/1');
+      await activeWriter.commit('1/1');
+
+      await factory.restartReplication(active.replicationStreamId);
+
+      const replicatingStreams = await factory.getReplicatingReplicationStreams();
+      expect(replicatingStreams).toHaveLength(1);
+      expect(replicatingStreams[0].replicationStreamId).not.toEqual(active.replicationStreamId);
+      expect(replicatingStreams[0].state).toBe(storage.SyncRuleState.PROCESSING);
+
+      const oldStream = (await (factory as MongoBucketStorage).db.sync_rules.findOne({
+        _id: active.replicationStreamId
+      })) as ReplicationStreamDocumentV3;
+      expect(oldStream.state).toBe(storage.SyncRuleState.ERRORED);
+      expect(oldStream.sync_configs.map((config) => config.state)).toEqual([storage.SyncRuleState.ERRORED]);
+    }
+  );
+
+  test.runIf(storageVersion >= 3)('restart errors an active stream with an embedded deploying config', async () => {
+    await using factory = await storageConfig.factory();
+
+    const active = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+        { storageVersion }
+      )
+    );
+    const activeStorage = (await getTestStorage(factory, active)) as MongoSyncBucketStorage;
+    await using activeWriter = await activeStorage.createWriter(test_utils.BATCH_OPTIONS);
+    await activeWriter.markAllSnapshotDone('1/1');
+    await activeWriter.commit('1/1');
+
+    const deploying = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 3
+
+streams:
+  by_project:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+`,
+        { storageVersion }
+      )
+    );
+    expect(deploying.replicationStreamId).toEqual(active.replicationStreamId);
+
+    await factory.restartReplication(active.replicationStreamId);
+
+    const replicatingStreams = await factory.getReplicatingReplicationStreams();
+    expect(replicatingStreams).toHaveLength(1);
+    expect(replicatingStreams[0].replicationStreamId).not.toEqual(active.replicationStreamId);
+
+    const oldStream = (await (factory as MongoBucketStorage).db.sync_rules.findOne({
+      _id: active.replicationStreamId
+    })) as ReplicationStreamDocumentV3;
+    expect(oldStream.state).toBe(storage.SyncRuleState.ERRORED);
+    expect(oldStream.sync_configs.map((config) => config.state)).toEqual([
+      storage.SyncRuleState.ERRORED,
+      storage.SyncRuleState.STOP
+    ]);
+    const oldActive = await factory.getActiveSyncConfig();
+    expect(oldActive).not.toBeNull();
+    expect(oldActive!.replicationStream.syncConfigContent).toHaveLength(1);
+    await expect(oldActive!.storage.getCheckpoint()).resolves.toBeDefined();
+  });
+
+  test.runIf(storageVersion >= 3)(
+    'appended compatible config adopts the stream checkpoint instead of regressing to 0',
+    async () => {
+      await using factory = await storageConfig.factory();
+
+      // First config replicates some data, advancing the stream-level op head and its checkpoint.
+      const first = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(
+          `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+          { storageVersion }
+        )
+      );
+      const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+      await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+      const sourceTable = await test_utils.resolveTestTable(
+        firstWriter,
+        'todos',
+        ['id'],
+        INITIALIZED_MONGO_STORAGE_FACTORY
+      );
+      await firstWriter.save({
+        sourceTable,
+        tag: storage.SaveOperationTag.INSERT,
+        after: {
+          id: 'todo-1',
+          owner_id: 'user-1',
+          project_id: 'project-1'
+        },
+        afterReplicaId: test_utils.rid('todo-1')
+      });
+      await firstWriter.markAllSnapshotDone('1/1');
+      await firstWriter.commit('1/1');
+
+      const firstCheckpoint = (await firstStorage.getCheckpoint()).checkpoint;
+      expect(firstCheckpoint).toBeGreaterThan(0n);
+
+      const mongoFactory = factory as MongoBucketStorage;
+      const streamDocBefore = (await mongoFactory.db.sync_rules.findOne({
+        _id: first.replicationStreamId
+      })) as ReplicationStreamDocumentV3;
+      // The stream-level head was advanced durably to (at least) the first config's checkpoint.
+      expect(streamDocBefore.last_persisted_op).not.toBeNull();
+      expect(BigInt(streamDocBefore.last_persisted_op!)).toBeGreaterThanOrEqual(firstCheckpoint);
+
+      // Append a compatible second config that replicates nothing new.
+      const second = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(
+          `
+config:
+  edition: 3
+
+streams:
+  by_project:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+`,
+          { storageVersion }
+        )
+      );
+      expect(second.replicationStreamId).toEqual(first.replicationStreamId);
+
+      const replicatingStreams = await factory.getReplicatingReplicationStreams();
+      expect(replicatingStreams).toHaveLength(1);
+      const secondStorage = (await getTestStorage(factory, replicatingStreams[0])) as MongoSyncBucketStorage;
+      await using secondWriter = await secondStorage.createWriter(test_utils.BATCH_OPTIONS);
+      // No new data replicated - just complete the snapshot and commit.
+      await secondWriter.markAllSnapshotDone('2/1');
+      await secondWriter.commit('2/1');
+
+      // The appended config's checkpoint must adopt the stream head, not regress to 0.
+      const streamDocAfter = (await mongoFactory.db.sync_rules.findOne({
+        _id: first.replicationStreamId
+      })) as ReplicationStreamDocumentV3;
+      const head = BigInt(streamDocAfter.last_persisted_op!);
+      for (const config of streamDocAfter.sync_configs) {
+        expect(config.last_checkpoint).not.toBeNull();
+        expect(BigInt(config.last_checkpoint!)).toEqual(head);
+      }
+      // All configs share the same checkpoint, equal to the stream head.
+      expect(head).toBeGreaterThanOrEqual(firstCheckpoint);
+
+      // After activation, the active config's checkpoint does not regress.
+      const activeStorage = (await getTestStorage(
+        factory,
+        (await factory.getActiveSyncConfig())!.replicationStream
+      )) as MongoSyncBucketStorage;
+      const activeCheckpoint = (await activeStorage.getCheckpoint()).checkpoint;
+      expect(activeCheckpoint).toBeGreaterThanOrEqual(firstCheckpoint);
+    }
+  );
+
+  test.runIf(storageVersion >= 3)('creates a new replication stream when compatibility options differ', async () => {
+    await using factory = await storageConfig.factory();
+
+    const first = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+        { storageVersion }
+      )
+    );
+    const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+    await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+    await firstWriter.markAllSnapshotDone('1/1');
+    await firstWriter.commit('1/1');
+
+    // Same streams, but a different compatibility edition - must not append to the active stream.
+    const second = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 2
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+        { storageVersion }
+      )
+    );
+    expect(second.replicationStreamId).not.toEqual(first.replicationStreamId);
+
+    // The first stream stays active until the replacement has replicated.
+    const active = await factory.getActiveSyncConfig();
+    expect(active?.replicationStream.replicationStreamId).toEqual(first.replicationStreamId);
+    expect((await factory.getDeployingSyncConfig())?.replicationStream.replicationStreamId).toEqual(
+      second.replicationStreamId
+    );
+  });
+
+  test.runIf(storageVersion >= 3)(
+    'creates a new replication stream for legacy sync rules without a serialized plan',
+    async () => {
+      await using factory = await storageConfig.factory();
+
+      const first = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(
+          `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+          { storageVersion }
+        )
+      );
+      const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+      await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+      await firstWriter.markAllSnapshotDone('1/1');
+      await firstWriter.commit('1/1');
+
+      // Legacy sync rules have no serialized plan - must not append to the active stream.
+      const second = await factory.updateSyncRules(updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, { storageVersion }));
+      expect(second.replicationStreamId).not.toEqual(first.replicationStreamId);
+    }
+  );
+
+  test.runIf(storageVersion >= 3)('does not append to an active legacy sync config', async () => {
+    await using factory = await storageConfig.factory();
+
+    const first = await factory.updateSyncRules(updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, { storageVersion }));
+    const firstStorage = (await getTestStorage(factory, first)) as MongoSyncBucketStorage;
+    await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+    await firstWriter.markAllSnapshotDone('1/1');
+    await firstWriter.commit('1/1');
+
+    // The active config has no serialized plan, so a new streams config must not be appended to it.
+    const second = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(
+        `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`,
+        { storageVersion }
+      )
+    );
+    expect(second.replicationStreamId).not.toEqual(first.replicationStreamId);
   });
 
   test.runIf(storageVersion < 3)('can replace processing legacy sync rules', async () => {
@@ -600,7 +1649,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     ).resolves.toBeDefined();
 
     const mongoFactory = factory as MongoBucketStorage;
-    expect((await mongoFactory.db.sync_rules.findOne({ _id: firstSyncRules.id }))?.state).toBe(
+    expect((await mongoFactory.db.sync_rules.findOne({ _id: firstSyncRules.replicationStreamId }))?.state).toBe(
       storage.SyncRuleState.STOP
     );
   });
@@ -612,8 +1661,46 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
       updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, { storageVersion, lock: true })
     );
 
-    expect(syncRules.current_lock?.sync_rules_id).toBe(syncRules.id);
+    expect(syncRules.current_lock?.sync_rules_id).toBe(syncRules.replicationStreamId);
     await syncRules.current_lock?.release();
+  });
+
+  test.runIf(storageVersion >= 3)('does not lock when appending a sync config to an existing stream', async () => {
+    await using factory = await storageConfig.factory();
+
+    const firstRules = `
+config:
+  edition: 3
+
+streams:
+  by_owner:
+    query: SELECT * FROM todos WHERE owner_id = subscription.parameter('owner_id')
+`;
+    const secondRules = `
+config:
+  edition: 3
+
+streams:
+  by_project:
+    query: SELECT * FROM todos WHERE project_id = subscription.parameter('project_id')
+`;
+
+    const first = await factory.updateSyncRules(updateSyncRulesFromYaml(firstRules, { storageVersion, lock: true }));
+    expect(first.current_lock?.sync_rules_id).toBe(first.replicationStreamId);
+    try {
+      const firstStorage = factory.getInstance(first, { replicationLock: first.current_lock! });
+      await using firstWriter = await firstStorage.createWriter(test_utils.BATCH_OPTIONS);
+      await firstWriter.markAllSnapshotDone('1/1');
+      await firstWriter.commit('1/1');
+
+      const second = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(secondRules, { storageVersion, lock: true })
+      );
+      expect(second.replicationStreamId).toBe(first.replicationStreamId);
+      expect(second.current_lock).toBeNull();
+    } finally {
+      await first.current_lock?.release();
+    }
   });
 
   test.runIf(storageVersion < 3)('uses a single current_data collection for v1 source records', async () => {
@@ -629,7 +1716,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const sourceTable = await test_utils.resolveTestTable(writer, 'test', ['id'], INITIALIZED_MONGO_STORAGE_FACTORY);
@@ -647,10 +1734,10 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     await writer.commit('1/1');
 
     const mongoFactory = factory as MongoBucketStorage;
-    expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.id })).toBe(1);
+    expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.replicationStreamId })).toBe(1);
 
     const sourceRecordCollections = await mongoFactory.db.db
-      .listCollections({ name: new RegExp(`^source_records_${syncRules.id}_`) }, { nameOnly: true })
+      .listCollections({ name: new RegExp(`^source_records_${syncRules.replicationStreamId}_`) }, { nameOnly: true })
       .toArray();
     expect(sourceRecordCollections).toEqual([]);
   });
@@ -668,7 +1755,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const sourceTable = await test_utils.resolveTestTable(writer, 'test', ['id'], INITIALIZED_MONGO_STORAGE_FACTORY);
@@ -686,12 +1773,102 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     await writer.commit('1/1');
 
     const mongoFactory = factory as MongoBucketStorage;
-    expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.id })).toBe(1);
+    expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.replicationStreamId })).toBe(1);
 
     await bucketStorage.clear();
 
-    expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.id })).toBe(0);
+    expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.replicationStreamId })).toBe(0);
   });
+
+  test.runIf(storageVersion < 3)(
+    'clear removes large v1 current_data sets without affecting other streams',
+    async () => {
+      await using factory = await storageConfig.factory();
+      const syncRules = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, {
+          storageVersion
+        })
+      );
+      const bucketStorage = await getTestStorage(factory, syncRules);
+      const mongoFactory = factory as MongoBucketStorage;
+      const sourceTableId = new bson.ObjectId();
+      const documents = Array.from({ length: 10_002 }, (_, index) => ({
+        _id: {
+          g: syncRules.replicationStreamId,
+          t: sourceTableId,
+          k: index
+        },
+        data: new bson.Binary(),
+        buckets: [],
+        lookups: []
+      }));
+      await mongoFactory.db.current_data.insertMany([
+        ...documents,
+        {
+          _id: {
+            g: syncRules.replicationStreamId + 1,
+            t: sourceTableId,
+            k: 0
+          },
+          data: new bson.Binary(),
+          buckets: [],
+          lookups: []
+        }
+      ]);
+
+      await bucketStorage.clear();
+
+      expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.replicationStreamId })).toBe(0);
+      expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.replicationStreamId + 1 })).toBe(1);
+    }
+  );
+
+  test.runIf(storageVersion < 3)(
+    'clear removes large v1 parameter index sets without affecting other streams',
+    async () => {
+      await using factory = await storageConfig.factory();
+      const syncRules = await factory.updateSyncRules(
+        updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, {
+          storageVersion
+        })
+      );
+      const bucketStorage = await getTestStorage(factory, syncRules);
+      const mongoFactory = factory as MongoBucketStorage;
+      const sourceTableId = new bson.ObjectId();
+      const documents = Array.from({ length: 10_002 }, (_, index) => ({
+        _id: BigInt(index * 2),
+        key: {
+          g: syncRules.replicationStreamId,
+          t: sourceTableId,
+          k: index
+        },
+        lookup: new bson.Binary(),
+        bucket_parameters: []
+      }));
+      await mongoFactory.db.bucket_parameters.insertMany([
+        ...documents,
+        {
+          _id: 1n,
+          key: {
+            g: syncRules.replicationStreamId + 1,
+            t: sourceTableId,
+            k: 0
+          },
+          lookup: new bson.Binary(),
+          bucket_parameters: []
+        }
+      ]);
+
+      await bucketStorage.clear();
+
+      expect(await mongoFactory.db.bucket_parameters.countDocuments({ 'key.g': syncRules.replicationStreamId })).toBe(
+        0
+      );
+      expect(
+        await mongoFactory.db.bucket_parameters.countDocuments({ 'key.g': syncRules.replicationStreamId + 1 })
+      ).toBe(1);
+    }
+  );
 
   test.runIf(storageVersion < 3)('storage metrics include v1 current_data', async () => {
     await using factory = await storageConfig.factory();
@@ -706,7 +1883,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         { storageVersion }
       )
     );
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
     const metricsBefore = await factory.getStorageMetrics();
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
@@ -725,10 +1902,26 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     await writer.commit('1/1');
 
     const mongoFactory = factory as MongoBucketStorage;
-    expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.id })).toBe(1);
+    expect(await mongoFactory.db.current_data.countDocuments({ '_id.g': syncRules.replicationStreamId })).toBe(1);
 
     const metricsAfter = await factory.getStorageMetrics();
     expect(metricsAfter.replication_size_bytes).toBeGreaterThan(metricsBefore.replication_size_bytes);
+  });
+
+  test.runIf(storageVersion >= 3)('storage metrics include the sync config version label', async () => {
+    await using factory = await storageConfig.factory();
+    const syncRules = await factory.updateSyncRules(
+      updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, { storageVersion, version_label: 'metrics-test' })
+    );
+
+    const metrics = await factory.getStorageMetrics();
+
+    expect(metrics.sync_config_metrics).toContainEqual(
+      expect.objectContaining({
+        sync_config_id: syncRules.syncConfigContent[0].syncConfigId,
+        version_label: 'metrics-test'
+      })
+    );
   });
 
   test.runIf(storageVersion >= 3)(
@@ -753,7 +1946,7 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
           { storageVersion }
         )
       );
-      const bucketStorage = factory.getInstance(syncRules) as MongoSyncBucketStorage;
+      const bucketStorage = (await getTestStorage(factory, syncRules)) as MongoSyncBucketStorage;
       const previousCheckpoint = await bucketStorage.getCheckpoint();
 
       await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
@@ -798,25 +1991,25 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
     );
 
     const mongoFactory = factory as MongoBucketStorage;
-    const bucketStorage = mongoFactory.getInstance(syncRules) as any;
-    const db = bucketStorage.db;
-    await db.initializeStreamStorage(syncRules.id);
+    const bucketStorage = await getTestStorage(mongoFactory, syncRules);
+    const db = bucketStorage.db as VersionedPowerSyncMongoV3;
+    await db.initializeStreamStorage(syncRules.replicationStreamId);
 
     const sourceTableA = new bson.ObjectId();
     const sourceTableB = new bson.ObjectId();
-    await db.sourceTablesV3(syncRules.id).insertMany([
+    await db.sourceTables(syncRules.replicationStreamId).insertMany([
       {
         _id: sourceTableA,
         connection_id: 1,
         relation_id: 'a',
         schema_name: 'public',
         table_name: 'table_a',
-        replica_id_columns: null,
-        replica_id_columns2: [],
+        replica_id_columns: [],
         snapshot_done: true,
         snapshot_status: undefined,
         bucket_data_source_ids: [],
         parameter_lookup_source_ids: [],
+        event_definition_ids: [],
         latest_pending_delete: 9n
       },
       {
@@ -825,45 +2018,63 @@ function registerSyncStorageTests(storageConfig: storage.TestStorageConfig, stor
         relation_id: 'b',
         schema_name: 'public',
         table_name: 'table_b',
-        replica_id_columns: null,
-        replica_id_columns2: [],
+        replica_id_columns: [],
         snapshot_done: true,
         snapshot_status: undefined,
         bucket_data_source_ids: [],
         parameter_lookup_source_ids: [],
+        event_definition_ids: [],
         latest_pending_delete: 12n
       }
     ]);
 
-    await db.sourceRecordsV3(syncRules.id, sourceTableA).insertMany([
+    await db.sourceRecords(syncRules.replicationStreamId, sourceTableA).insertMany([
       { _id: 'deleted-1', data: null, buckets: [], lookups: [], pending_delete: 5n },
       { _id: 'deleted-2', data: null, buckets: [], lookups: [], pending_delete: 9n },
       { _id: 'active', data: null, buckets: [], lookups: [] }
     ]);
     await db
-      .sourceRecordsV3(syncRules.id, sourceTableB)
+      .sourceRecords(syncRules.replicationStreamId, sourceTableB)
       .insertMany([{ _id: 'later-delete', data: null, buckets: [], lookups: [], pending_delete: 12n }]);
 
-    const store = new SourceRecordStoreV3(db, syncRules.id, bucketStorage.sync_rules.mapping);
+    const store = new SourceRecordStoreV3(
+      db,
+      syncRules.replicationStreamId,
+      bucketStorage.replicationStream.syncConfigContent[0].mapping
+    );
     const logger = { info() {} } as any;
 
     await store.postCommitCleanup(6n, logger);
 
-    expect(await db.sourceRecordsV3(syncRules.id, sourceTableA).countDocuments({ pending_delete: 5n })).toBe(0);
-    expect(await db.sourceRecordsV3(syncRules.id, sourceTableA).countDocuments({ pending_delete: 9n })).toBe(1);
-    expect(await db.sourceRecordsV3(syncRules.id, sourceTableB).countDocuments({ pending_delete: 12n })).toBe(1);
-    expect((await db.sourceTablesV3(syncRules.id).findOne({ _id: sourceTableA }))?.latest_pending_delete).toBe(9n);
-    expect((await db.sourceTablesV3(syncRules.id).findOne({ _id: sourceTableB }))?.latest_pending_delete).toBe(12n);
+    expect(
+      await db.sourceRecords(syncRules.replicationStreamId, sourceTableA).countDocuments({ pending_delete: 5n })
+    ).toBe(0);
+    expect(
+      await db.sourceRecords(syncRules.replicationStreamId, sourceTableA).countDocuments({ pending_delete: 9n })
+    ).toBe(1);
+    expect(
+      await db.sourceRecords(syncRules.replicationStreamId, sourceTableB).countDocuments({ pending_delete: 12n })
+    ).toBe(1);
+    expect(
+      (await db.sourceTables(syncRules.replicationStreamId).findOne({ _id: sourceTableA }))?.latest_pending_delete
+    ).toBe(9n);
+    expect(
+      (await db.sourceTables(syncRules.replicationStreamId).findOne({ _id: sourceTableB }))?.latest_pending_delete
+    ).toBe(12n);
 
     await store.postCommitCleanup(10n, logger);
 
     expect(
-      await db.sourceRecordsV3(syncRules.id, sourceTableA).countDocuments({ pending_delete: { $exists: true } })
+      await db
+        .sourceRecords(syncRules.replicationStreamId, sourceTableA)
+        .countDocuments({ pending_delete: { $exists: true } })
     ).toBe(0);
     expect(
-      (await db.sourceTablesV3(syncRules.id).findOne({ _id: sourceTableA }))?.latest_pending_delete
+      (await db.sourceTables(syncRules.replicationStreamId).findOne({ _id: sourceTableA }))?.latest_pending_delete
     ).toBeUndefined();
-    expect((await db.sourceTablesV3(syncRules.id).findOne({ _id: sourceTableB }))?.latest_pending_delete).toBe(12n);
+    expect(
+      (await db.sourceTables(syncRules.replicationStreamId).findOne({ _id: sourceTableB }))?.latest_pending_delete
+    ).toBe(12n);
   });
 }
 
@@ -875,24 +2086,24 @@ describe('sync - mongodb', () => {
     const legacySyncRules = await factory.updateSyncRules(
       updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, { storageVersion: storage.LEGACY_STORAGE_VERSION })
     );
-    const legacyStorage = factory.getInstance(legacySyncRules);
+    const legacyStorage = await getTestStorage(factory, legacySyncRules);
     await using legacyWriter = await legacyStorage.createWriter(test_utils.BATCH_OPTIONS);
     await legacyWriter.markAllSnapshotDone('1/1');
     await legacyWriter.commit('1/1');
 
-    expect((await mongoFactory.db.sync_rules.findOne({ _id: legacySyncRules.id }))?.state).toBe(
+    expect((await mongoFactory.db.sync_rules.findOne({ _id: legacySyncRules.replicationStreamId }))?.state).toBe(
       storage.SyncRuleState.ACTIVE
     );
 
     const v3SyncRules = await factory.updateSyncRules(
       updateSyncRulesFromYaml(MINIMAL_SYNC_RULES, { storageVersion: storage.STORAGE_VERSION_3 })
     );
-    const v3Storage = factory.getInstance(v3SyncRules);
+    const v3Storage = await getTestStorage(factory, v3SyncRules);
     await using v3Writer = await v3Storage.createWriter(test_utils.BATCH_OPTIONS);
     await v3Writer.markAllSnapshotDone('2/1');
     await v3Writer.commit('2/1');
 
-    expect((await mongoFactory.db.sync_rules.findOne({ _id: legacySyncRules.id }))?.state).toBe(
+    expect((await mongoFactory.db.sync_rules.findOne({ _id: legacySyncRules.replicationStreamId }))?.state).toBe(
       storage.SyncRuleState.STOP
     );
   });
@@ -900,6 +2111,233 @@ describe('sync - mongodb', () => {
   for (const storageVersion of TEST_STORAGE_VERSIONS) {
     describe(`storage v${storageVersion}`, () => {
       registerSyncStorageTests(INITIALIZED_MONGO_STORAGE_FACTORY, storageVersion);
+
+      describe.runIf(storageVersion >= 3)('V3 read filtering boundaries', () => {
+        async function setupFilteringTest() {
+          await using factory = await INITIALIZED_MONGO_STORAGE_FACTORY.factory();
+          const syncRules = await factory.updateSyncRules(
+            updateSyncRulesFromYaml(
+              `
+          bucket_definitions:
+            global:
+              data:
+                - SELECT id, description FROM test
+          `,
+              { storageVersion }
+            )
+          );
+          const bucketStorage = (await getTestStorage(factory, syncRules)) as MongoSyncBucketStorage;
+          const db = bucketStorage.db as VersionedPowerSyncMongoV3;
+          const mapping = syncRules.syncConfigContent[0].mapping;
+
+          const request = bucketRequest(syncRules.syncConfigContent[0], 'global[]', 0n);
+          const definitionId = mapping.bucketSourceId(request.source);
+          const collection = db.bucketData(syncRules.replicationStreamId, definitionId);
+
+          const bucketName = request.bucket;
+          const sourceTable = new bson.ObjectId();
+          const bucketKey: BucketKey = {
+            replicationStreamId: syncRules.replicationStreamId,
+            definitionId,
+            bucket: bucketName
+          };
+
+          function makeOps(opIds: bigint[]): BucketDataDoc[] {
+            return opIds.map((opId) => ({
+              bucketKey,
+              o: opId,
+              op: 'PUT' as const,
+              source_table: sourceTable,
+              source_key: test_utils.rid(`row-${opId}`),
+              table: 'items',
+              row_id: `row-${opId}`,
+              checksum: BigInt(opId) * 10n,
+              data: `{"id":"row-${opId}"}`
+            }));
+          }
+
+          const docA = serializeBucketData(bucketName, makeOps([10n, 20n, 30n]));
+          const docB = serializeBucketData(bucketName, makeOps([40n, 50n, 60n]));
+          const docC = serializeBucketData(bucketName, makeOps([70n, 80n, 90n]));
+
+          await collection.insertMany([docA, docB, docC]);
+
+          return { factory, syncRules, bucketStorage, bucketName };
+        }
+
+        async function getFilteredOps(start: number, checkpoint: number): Promise<bigint[]> {
+          const { syncRules, bucketStorage } = await setupFilteringTest();
+          const request = bucketRequest(syncRules.syncConfigContent[0], 'global[]', BigInt(start));
+          const batch = await test_utils.getBatchArray(
+            bucketStorage.getBucketDataBatch(test_utils.testCheckpoint(BigInt(checkpoint)), [request])
+          );
+          const ops = batch.flatMap((b) => b.chunkData.data.map((d) => BigInt(d.op_id)));
+          return ops;
+        }
+
+        test('case 1: start=5, checkpoint=95 → all ops', async () => {
+          const ops = await getFilteredOps(5, 95);
+          expect(ops).toEqual([10n, 20n, 30n, 40n, 50n, 60n, 70n, 80n, 90n]);
+        });
+
+        test('case 2: start=10, checkpoint=90 → ops in (10,90]', async () => {
+          const ops = await getFilteredOps(10, 90);
+          expect(ops).toEqual([20n, 30n, 40n, 50n, 60n, 70n, 80n, 90n]);
+        });
+
+        test('case 3: start=15, checkpoint=85 → partial doc boundaries', async () => {
+          const ops = await getFilteredOps(15, 85);
+          expect(ops).toEqual([20n, 30n, 40n, 50n, 60n, 70n, 80n]);
+        });
+
+        test('case 4: start=25, checkpoint=55 → spans two docs', async () => {
+          const ops = await getFilteredOps(25, 55);
+          expect(ops).toEqual([30n, 40n, 50n]);
+        });
+
+        test('case 5: start=35, checkpoint=45 → single op within doc', async () => {
+          const ops = await getFilteredOps(35, 45);
+          expect(ops).toEqual([40n]);
+        });
+
+        test('case 6: start=35, checkpoint=65 → full doc B', async () => {
+          const ops = await getFilteredOps(35, 65);
+          expect(ops).toEqual([40n, 50n, 60n]);
+        });
+
+        test('case 7: start=25, checkpoint=35 → single op from doc A', async () => {
+          const ops = await getFilteredOps(25, 35);
+          expect(ops).toEqual([30n]);
+        });
+
+        test('case 8: start=30, checkpoint=40 → op at checkpoint from next doc', async () => {
+          const ops = await getFilteredOps(30, 40);
+          expect(ops).toEqual([40n]);
+        });
+
+        test('case 9: start=100, checkpoint=200 → beyond all docs', async () => {
+          const ops = await getFilteredOps(100, 200);
+          expect(ops).toEqual([]);
+        });
+
+        test('case 10: start=0, checkpoint=5 → before all docs', async () => {
+          const ops = await getFilteredOps(0, 5);
+          expect(ops).toEqual([]);
+        });
+
+        test('case 11: start=50, checkpoint=50 → zero-width range', async () => {
+          const ops = await getFilteredOps(50, 50);
+          expect(ops).toEqual([]);
+        });
+
+        test('case 12: start=45, checkpoint=50 → op at checkpoint boundary', async () => {
+          const ops = await getFilteredOps(45, 50);
+          expect(ops).toEqual([50n]);
+        });
+
+        test('case 13: start=50, checkpoint=55 → no ops strictly after start', async () => {
+          const ops = await getFilteredOps(50, 55);
+          expect(ops).toEqual([]);
+        });
+
+        test('all-filtered first batch still returns data behind the batch boundary', async () => {
+          // Documents straddling the requested (start, end] window are matched by the
+          // query, but contribute no rows after filtering. If an entire server batch
+          // (~101 documents) consists of such straddlers, the remaining documents in
+          // the cursor must still be reachable. Storage reports the straddler buckets
+          // as complete via empty chunks, and the caller re-requests the rest.
+          await using factory = await INITIALIZED_MONGO_STORAGE_FACTORY.factory();
+          const syncRules = await factory.updateSyncRules(
+            updateSyncRulesFromYaml(
+              `
+          bucket_definitions:
+            by_user:
+              parameters: select request.user_id() as user_id
+              data: [select * from test where owner_id = bucket.user_id]
+          `,
+              { storageVersion }
+            )
+          );
+          const bucketStorage = (await getTestStorage(factory, syncRules)) as MongoSyncBucketStorageV3;
+          const db = bucketStorage.db as VersionedPowerSyncMongoV3;
+
+          const start = 5n;
+          const end = 50n;
+
+          // 150 buckets sorted before the data bucket, each with a single document
+          // containing ops at 1 and 100: matched (_id.o=100 > start, min_op=1 <= end),
+          // but no op in (5, 50].
+          const straddlerNames = Array.from({ length: 150 }, (_, i) => `b${`${i}`.padStart(3, '0')}`);
+          const requests = [...straddlerNames, 'zzz'].map((id) =>
+            bucketRequest(syncRules.syncConfigContent[0], `by_user["${id}"]`, start)
+          );
+          const mapping = syncRules.syncConfigContent[0].mapping;
+          const definitionId = mapping.bucketSourceId(requests[0].source);
+          const collection = db.bucketData(syncRules.replicationStreamId, definitionId);
+          const sourceTable = new bson.ObjectId();
+
+          function makeOps(bucket: string, opIds: bigint[]): BucketDataDoc[] {
+            const bucketKey: BucketKey = {
+              replicationStreamId: syncRules.replicationStreamId,
+              definitionId,
+              bucket
+            };
+            return opIds.map((opId) => ({
+              bucketKey,
+              o: opId,
+              op: 'PUT' as const,
+              source_table: sourceTable,
+              source_key: test_utils.rid(`row-${opId}`),
+              table: 'test',
+              row_id: `row-${opId}`,
+              checksum: BigInt(opId) * 10n,
+              data: `{"id":"row-${opId}"}`
+            }));
+          }
+
+          const straddlerDocs = requests
+            .slice(0, -1)
+            .map((request) => serializeBucketData(request.bucket, makeOps(request.bucket, [1n, 100n])));
+          const dataBucket = requests[requests.length - 1].bucket;
+          const dataDoc = serializeBucketData(dataBucket, makeOps(dataBucket, [10n]));
+          await collection.insertMany([...straddlerDocs, dataDoc]);
+
+          // Emulate the caller loop in sync.ts / BucketChecksumState: advance bucket
+          // positions from each chunk, drop completed buckets, and re-request while
+          // any chunk reported has_more.
+          const positions = new Map(requests.map((request) => [request.bucket, request.start]));
+          const pending = new Set(positions.keys());
+          const receivedOps: bigint[] = [];
+          let rounds = 0;
+
+          while (rounds < 10) {
+            rounds++;
+            const roundRequests = requests
+              .filter((request) => pending.has(request.bucket))
+              .map((request) => ({ ...request, start: positions.get(request.bucket)! }));
+            const batch = await test_utils.getBatchArray(
+              bucketStorage.getBucketDataBatch(test_utils.testCheckpoint(end), roundRequests)
+            );
+            let anyHasMore = false;
+            for (const { chunkData } of batch) {
+              positions.set(chunkData.bucket, BigInt(chunkData.next_after));
+              if (chunkData.has_more) {
+                anyHasMore = true;
+              } else {
+                pending.delete(chunkData.bucket);
+              }
+              receivedOps.push(...chunkData.data.map((entry) => BigInt(entry.op_id)));
+            }
+            if (!anyHasMore) {
+              break;
+            }
+          }
+
+          // The op behind the all-straddler first batch must be returned.
+          expect(receivedOps).toEqual([10n]);
+          expect(rounds).toBeLessThan(10);
+        });
+      });
     });
   }
 });

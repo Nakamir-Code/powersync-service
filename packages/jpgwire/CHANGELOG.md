@@ -1,5 +1,72 @@
 # @powersync/service-jpgwire
 
+## 0.21.26
+
+### Patch Changes
+
+- Updated dependencies [44ce423]
+- Updated dependencies [e703ca5]
+- Updated dependencies [324093e]
+- Updated dependencies [57ef2f4]
+- Updated dependencies [6700c71]
+  - @powersync/service-sync-rules@0.44.0
+
+## 0.21.25
+
+### Patch Changes
+
+- Updated dependencies [5078032]
+- Updated dependencies [e87703a]
+- Updated dependencies [18f0c95]
+- Updated dependencies [c60db6e]
+- Updated dependencies [0483d4e]
+  - @powersync/service-sync-rules@0.43.0
+
+## 0.21.24
+
+### Patch Changes
+
+- Updated dependencies [5ae6f75]
+  - @powersync/service-sync-rules@0.42.0
+
+## 0.21.23
+
+### Patch Changes
+
+- Updated dependencies [4b6a23e]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [646c0de]
+- Updated dependencies [3972bac]
+  - @powersync/service-sync-rules@0.41.0
+
+## 0.21.22
+
+### Patch Changes
+
+- 123c801: Reconnect PostgreSQL notification connections and restore `LISTEN` subscriptions when the underlying connection is terminated. Harden connection-slot retries and lease handling, and publish checkpoint notifications atomically with checkpoint updates.
+- Updated dependencies [8daa300]
+- Updated dependencies [be42e25]
+- Updated dependencies [cb4c627]
+  - @powersync/service-sync-rules@0.40.0
+
+## 0.21.21
+
+### Patch Changes
+
+- Updated dependencies [ea71bf3]
+- Updated dependencies [edc6ed4]
+  - @powersync/service-sync-rules@0.39.0
+
+## 0.21.20
+
+### Patch Changes
+
+- Updated dependencies [184c39f]
+- Updated dependencies [c3f75df]
+- Updated dependencies [4bd35ea]
+  - @powersync/service-sync-rules@0.38.0
+
 ## 0.21.19
 
 ### Patch Changes

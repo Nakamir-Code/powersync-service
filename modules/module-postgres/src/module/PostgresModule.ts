@@ -7,8 +7,6 @@ import {
   replication,
   system
 } from '@powersync/service-core';
-import * as jpgwire from '@powersync/service-jpgwire';
-import { ReplicationMetric } from '@powersync/service-types';
 import { PostgresRouteAPIAdapter } from '../api/PostgresRouteAPIAdapter.js';
 import { ConnectionManagerFactory } from '../replication/ConnectionManagerFactory.js';
 import { PgManager } from '../replication/PgManager.js';
@@ -29,18 +27,6 @@ export class PostgresModule extends replication.ReplicationModule<types.Postgres
     });
   }
 
-  async onInitialized(context: system.ServiceContextContainer): Promise<void> {
-    // Record replicated bytes using global jpgwire metrics. Only registered if this module is replicating
-    if (context.replicationEngine) {
-      jpgwire.setMetricsRecorder({
-        addBytesRead(bytes) {
-          context.metricsEngine.getCounter(ReplicationMetric.DATA_REPLICATED_BYTES).add(bytes);
-        }
-      });
-      this.logger.info('Successfully set up connection metrics recorder for PostgresModule.');
-    }
-  }
-
   protected createRouteAPIAdapter(): api.RouteAPI {
     return PostgresRouteAPIAdapter.withConfig(this.resolveConfig(this.decodedConfig!));
   }
@@ -54,9 +40,11 @@ export class PostgresModule extends replication.ReplicationModule<types.Postgres
       id: this.getDefaultId(normalisedConfig.database),
       syncRuleProvider: syncRuleProvider,
       storageEngine: context.storageEngine,
+      configuration: context.configuration,
       metricsEngine: context.metricsEngine,
       connectionFactory: connectionFactory,
-      rateLimiter: new PostgresErrorRateLimiter()
+      rateLimiter: new PostgresErrorRateLimiter(),
+      heartbeatIntervalSeconds: normalisedConfig.heartbeat_interval_seconds
     });
   }
 
@@ -79,14 +67,18 @@ export class PostgresModule extends replication.ReplicationModule<types.Postgres
     });
 
     try {
-      if (options.syncRules) {
-        // TODO: In the future, once we have more replication types, we will need to check if these syncRules are for Postgres
-        for (let syncRules of options.syncRules) {
+      const replicationStreams = options.replicationStreams ?? options.syncRules;
+      if (replicationStreams) {
+        // TODO: In the future, once we have more replication types, we will need to check if these replication streams are for Postgres
+        for (let replicationStream of replicationStreams) {
           try {
-            await cleanUpReplicationSlot(syncRules.slot_name, connectionManager.pool);
+            await cleanUpReplicationSlot(replicationStream.replicationStreamName, connectionManager.pool);
           } catch (e) {
             // Not really much we can do here for failures, most likely the database is no longer accessible
-            this.logger.warn(`Failed to fully clean up Postgres replication slot: ${syncRules.slot_name}`, e);
+            this.logger.warn(
+              `Failed to fully clean up Postgres replication slot: ${replicationStream.replicationStreamName}`,
+              e
+            );
           }
         }
       }

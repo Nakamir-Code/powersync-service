@@ -1,18 +1,25 @@
 import { JSONBig, JsonContainer } from '@powersync/service-jsonbig';
 import { BucketPriority, HydratedSyncConfig, ResolvedBucket, SqliteJsonValue } from '@powersync/service-sync-rules';
 
-import { AbortError } from 'ix/aborterror.js';
-
 import * as auth from '../auth/auth-index.js';
 import * as storage from '../storage/storage-index.js';
 import * as util from '../util/util-index.js';
 
 import { Logger, logger as defaultLogger } from '@powersync/lib-services-framework';
+import { isBatchEnd } from '../storage/storage-index.js';
 import { mergeAsyncIterables } from '../streams/streams-index.js';
-import { BucketChecksumState, CheckpointLine } from './BucketChecksumState.js';
+import { PerformanceTracer, type Span } from '../tracing/PerformanceTracer.js';
+import { BucketChecksumState, CheckpointLine, type SyncCheckpointTraceCategory } from './BucketChecksumState.js';
 import { OperationsSentStats, RequestTracker, statsForBatch } from './RequestTracker.js';
 import { SyncContext } from './SyncContext.js';
-import { TokenStreamOptions, acquireSemaphoreAbortable, settledPromise, tokenStream } from './util.js';
+import { TokenStreamOptions, acquireSemaphoreAbortable, isAbortError, settledPromise, tokenStream } from './util.js';
+
+type CheckpointTiming = Record<string, number>;
+
+interface ActiveCheckpointTrace {
+  tracer: PerformanceTracer<SyncCheckpointTraceCategory>;
+  span: Span;
+}
 
 export interface SyncStreamParameters {
   syncContext: SyncContext;
@@ -79,7 +86,7 @@ export async function* streamResponse(
   try {
     yield* merged;
   } catch (e) {
-    if (e instanceof AbortError) {
+    if (isAbortError(e)) {
       return;
     } else {
       throw e;
@@ -112,15 +119,21 @@ async function* streamResponseInner(
     syncRequest: params,
     logger: logger
   });
+  // The checkpoint iterator can have a pending next() while a data batch fails.
+  // Aborting this on cleanup makes that pending next() settle, so the watcher subscription
+  // is released instead of staying open until another checkpoint arrives. See the cleanup
+  // in the finally block below.
+  const checkpointWatchController = new AbortController();
   const stream = bucketStorage.watchCheckpointChanges({
     user_id: checkpointUserId,
-    signal
+    signal: AbortSignal.any([signal, checkpointWatchController.signal])
   });
   const newCheckpoints = stream[Symbol.asyncIterator]();
 
   type CheckpointAndLine = {
-    checkpoint: bigint;
+    checkpoint: storage.ReplicationCheckpoint;
     line: CheckpointLine | null;
+    trace: ActiveCheckpointTrace | null;
   };
 
   async function waitForNewCheckpointLine(): Promise<IteratorResult<CheckpointAndLine>> {
@@ -128,10 +141,49 @@ async function* streamResponseInner(
     if (next.done) {
       return { done: true, value: undefined };
     }
+    const cp = next.value.base;
 
-    const line = await checksumState.buildNextCheckpointLine(next.value);
-    return { done: false, value: { checkpoint: next.value.base.checkpoint, line } };
+    const tracer = new PerformanceTracer<SyncCheckpointTraceCategory>(`sync checkpoint ${cp.checkpoint}`);
+    const trace = {
+      tracer,
+      span: tracer.span('checkpoint')
+    };
+
+    try {
+      const line = await checksumState.buildNextCheckpointLine(next.value, trace.tracer);
+      return { done: false, value: { checkpoint: cp, line, trace: line == null ? null : trace } };
+    } catch (e) {
+      if (e instanceof storage.CheckpointChecksumInvalidatedError) {
+        // The checksum was not usable, so buildNextCheckpointLine has not advanced
+        // the connection state. Drop this candidate and wait for a checkpoint that
+        // is not split by a compaction-produced bucket-data document.
+        // This is different from other checkpoint_invalidated cases in that we hit
+        // this during checksum calculation, instead of on data read.
+        trace.span.end();
+        checksumState.invalidateChecksumBaseline();
+        logger.info(`checkpoint_invalidated: ${cp.checkpoint}`, {
+          reason: 'compacted_before_checkpoint_line',
+          bucket: e.bucket,
+          checkpoint: cp.checkpoint,
+          user_id: tokenPayload.userIdJson
+        });
+        return { done: false, value: { checkpoint: cp, line: null, trace: null } };
+      }
+      // Only end the span if we error. If we return normally, we pass ownership on to the caller.
+      trace.span.end();
+      throw e;
+    }
   }
+
+  function checkpointLogDetails(cp: storage.ReplicationCheckpoint) {
+    return {
+      checkpoint: cp.checkpoint,
+      user_id: tokenPayload.userIdJson,
+      ...tracker.getIncrementalCheckpointStats()
+    };
+  }
+
+  let activeCheckpoint: { checkpoint: storage.ReplicationCheckpoint; trace: ActiveCheckpointTrace } | null = null;
 
   try {
     let nextCheckpointPromise: Promise<PromiseSettledResult<IteratorResult<CheckpointAndLine>>> | undefined;
@@ -155,12 +207,19 @@ async function* streamResponseInner(
         // No update to sync
         continue;
       }
+      const trace = next.value.value.trace!;
+      const checkpoint = next.value.value.checkpoint;
+      const tracer = trace.tracer;
+      activeCheckpoint = { checkpoint, trace };
 
-      const { checkpointLine, bucketsToFetch } = line;
+      const { checkpointLine, bucketsToFetch, bucketDataRequestHint } = line;
 
       // Since yielding can block, we update the state just before yielding the line.
       line.advance();
-      yield checkpointLine;
+      {
+        using _ = tracer.span('sending', 'checkpoint');
+        yield checkpointLine;
+      }
 
       // Start syncing data for buckets up to the checkpoint. As soon as we have completed at least one priority and
       // at least 1000 operations, we also start listening for new checkpoints concurrently. When a new checkpoint comes
@@ -168,6 +227,8 @@ async function* streamResponseInner(
       // the new checkpoint.
       const abortCheckpointController = new AbortController();
       let syncedOperations = 0;
+
+      let checkpointResult: CheckpointResult | null = null;
 
       const abortCheckpointSignal = AbortSignal.any([abortCheckpointController.signal, signal]);
 
@@ -190,6 +251,11 @@ async function* streamResponseInner(
             while (true) {
               const next = await settledPromise(waitForNewCheckpointLine());
               if (next.status == 'rejected') {
+                if (isAbortError(next.reason)) {
+                  checkpointResult = { result: 'invalidated', invalidationReason: 'checkpoint_cancelled' };
+                } else {
+                  checkpointResult = { result: 'invalidated', invalidationReason: 'checkpoint_error' };
+                }
                 abortCheckpointController.abort();
               } else if (!next.value.done) {
                 if (next.value.value.line == null) {
@@ -200,6 +266,7 @@ async function* streamResponseInner(
 
                 // A new sync line can be emitted. Stop running the bucketDataInBatches() iterations, making the
                 // main flow reach the new checkpoint.
+                checkpointResult = { result: 'invalidated', invalidationReason: 'checkpoint_superseded' };
                 abortCheckpointController.abort();
               }
 
@@ -223,11 +290,12 @@ async function* streamResponseInner(
           break;
         }
 
-        yield* bucketDataInBatches({
+        const batchResult = yield* bucketDataInBatches({
           syncContext: syncContext,
           bucketStorage: bucketStorage,
-          checkpoint: next.value.value.checkpoint,
+          checkpoint,
           bucketsToFetch: buckets,
+          requestHint: bucketDataRequestHint,
           checkpointLine: line,
           legacyDataLines: !isEncodingAsBson && params.raw_data != true,
           onRowsSent: markOperationsSent,
@@ -237,8 +305,39 @@ async function* streamResponseInner(
           // Passing null here will emit a full sync complete message at the end. If we pass a priority, we'll emit a partial
           // sync complete message instead.
           forPriority: !isLast ? priority : null,
-          logger
+          logger,
+          tracer
         });
+        if (batchResult?.result == 'partial_checkpoint_complete') {
+          // We don't specifically include timing details here, since that would end the span.
+          // Timings are included in the checkpoint_complete following this.
+          logger.info(`partial_checkpoint_complete: ${checkpoint.checkpoint}`, {
+            priority,
+            ...checkpointLogDetails(checkpoint)
+          });
+        } else if (batchResult?.result != null) {
+          checkpointResult = batchResult;
+          break;
+        }
+      }
+
+      if (checkpointResult?.result == 'checkpoint_complete') {
+        logger.info(`checkpoint_complete: ${checkpoint.checkpoint}`, {
+          // Incremental stats since the last checkpoint_complete, partial_checkpoint_complete or checkpoint_invalidated
+          ...checkpointLogDetails(checkpoint),
+          // Timings since the last checkpoint or checkpoint_diff
+          ms: getCheckpointTraceTimings(trace.span)
+        });
+      } else if (checkpointResult?.result == 'invalidated') {
+        // A new checkpoint and checkpoint_complete should follow soon, but we log the stats already
+        logger.info(`checkpoint_invalidated: ${checkpoint.checkpoint}`, {
+          reason: checkpointResult.invalidationReason,
+          ...checkpointLogDetails(checkpoint),
+          ms: getCheckpointTraceTimings(trace.span)
+        });
+      }
+      if (checkpointResult != null) {
+        activeCheckpoint = null;
       }
 
       if (!abortCheckpointSignal.aborted) {
@@ -246,14 +345,33 @@ async function* streamResponseInner(
       }
     } while (!signal.aborted);
   } finally {
-    await newCheckpoints.return?.();
+    if (activeCheckpoint != null) {
+      const { checkpoint, trace } = activeCheckpoint;
+      logger.info(`checkpoint_interrupted: ${checkpoint.checkpoint}`, {
+        ...checkpointLogDetails(checkpoint),
+        ms: getCheckpointTraceTimings(trace.span)
+      });
+    }
+
+    // The abort makes a pending next() settle as soon as the storage watcher observes it,
+    // releasing the subscription. return() is still needed for the case where there is no
+    // pending next(): the watcher is then suspended at a yield and never observes the abort.
+    // Neither is awaited: async generators queue return() behind a pending next(), so
+    // awaiting it here would keep the connection open until the next checkpoint arrives.
+    checkpointWatchController.abort();
+    newCheckpoints.return?.().catch((e) => {
+      if (!isAbortError(e)) {
+        logger.warn('Error while closing the checkpoint watcher', e);
+      }
+    });
   }
 }
 
 interface BucketDataRequest {
   syncContext: SyncContext;
   bucketStorage: storage.SyncRulesBucketStorage;
-  checkpoint: util.InternalOpId;
+  checkpoint: storage.ReplicationCheckpoint;
+  requestHint: storage.BucketRequestHint;
   /** Contains current bucket state. Modified by the request as data is sent. */
   checkpointLine: CheckpointLine;
   /** Subset of checkpointLine.bucketsToFetch, filtered by priority. */
@@ -272,9 +390,20 @@ interface BucketDataRequest {
   forPriority: BucketPriority | null;
   onRowsSent: (stats: OperationsSentStats) => void;
   logger: Logger;
+  tracer: PerformanceTracer<SyncCheckpointTraceCategory>;
 }
 
-async function* bucketDataInBatches(request: BucketDataRequest) {
+type CheckpointResult =
+  | { result: 'partial_checkpoint_complete' }
+  | { result: 'checkpoint_complete' }
+  | {
+      result: 'invalidated';
+      invalidationReason: 'compacted' | 'checkpoint_error' | 'checkpoint_superseded' | 'checkpoint_cancelled';
+    };
+
+async function* bucketDataInBatches(
+  request: BucketDataRequest
+): AsyncGenerator<util.StreamingSyncLine | string | null, CheckpointResult | null> {
   let isDone = false;
   while (!request.abort_batch.aborted && !isDone) {
     // The code below is functionally the same as this for-await loop below.
@@ -291,9 +420,13 @@ async function* bucketDataInBatches(request: BucketDataRequest) {
       while (true) {
         const { value, done: iterDone } = await iter.next();
         if (iterDone) {
+          if (value != null) {
+            return value;
+          }
           break;
         } else {
           const { done, data } = value;
+          using _ = request.tracer.span('sending', 'data');
           yield data;
           if (done) {
             isDone = true;
@@ -301,9 +434,10 @@ async function* bucketDataInBatches(request: BucketDataRequest) {
         }
       }
     } finally {
-      await iter.return();
+      await iter.return(null);
     }
   }
+  return null;
 }
 
 interface BucketDataBatchResult {
@@ -314,11 +448,14 @@ interface BucketDataBatchResult {
 /**
  * Extracted as a separate internal function just to avoid memory leaks.
  */
-async function* bucketDataBatch(request: BucketDataRequest): AsyncGenerator<BucketDataBatchResult, void> {
+async function* bucketDataBatch(
+  request: BucketDataRequest
+): AsyncGenerator<BucketDataBatchResult, CheckpointResult | null> {
   const {
     syncContext,
     bucketStorage: storage,
     checkpoint,
+    requestHint,
     bucketsToFetch,
     checkpointLine,
     legacyDataLines,
@@ -328,45 +465,57 @@ async function* bucketDataBatch(request: BucketDataRequest): AsyncGenerator<Buck
     logger
   } = request;
 
+  const tracer = request.tracer;
   let checkpointInvalidated = false;
 
-  if (syncContext.syncSemaphore.isLocked()) {
-    logger.info('Sync concurrency limit reached, waiting for lock', { user_id: request.userIdForLogs });
-  }
-  const acquired = await acquireSemaphoreAbortable(syncContext.syncSemaphore, AbortSignal.any([abort_batch]));
+  const acquired = await tracer.span('acquiring_lock').with(async () => {
+    return acquireSemaphoreAbortable(syncContext.syncSemaphore, AbortSignal.any([abort_batch]));
+  });
   if (acquired === 'aborted') {
-    return;
+    return null;
   }
 
-  const [value, release] = acquired;
+  const [, release] = acquired;
   try {
-    if (value <= 3) {
-      // This can be noisy, so we only log when we get close to the
-      // concurrency limit.
-      logger.info(`Got sync lock. Slots available: ${value - 1}`, {
-        user_id: request.userIdForLogs,
-        sync_data_slots: value - 1
-      });
-    }
+    using _ = tracer.span('bucket_data');
+    let has_more = false;
     // Optimization: Only fetch buckets for which the checksums have changed since the last checkpoint
     // For the first batch, this will be all buckets.
     const filteredBuckets = checkpointLine.getFilteredBucketPositions(bucketsToFetch);
-    const dataBatches = storage.getBucketDataBatch(checkpoint, filteredBuckets);
-
-    let has_more = false;
-
-    for await (let { chunkData: r, targetOp } of dataBatches) {
+    const dataBatches = storage.getBucketDataBatch(checkpoint, filteredBuckets, {
+      requestHint,
+      tracer,
+      // Checkpoint supersession is a cooperative batch handoff. Only abort
+      // in-flight storage work when the connection itself is closed.
+      signal: abort_connection
+    });
+    for await (let chunk of dataBatches) {
       // Abort in current batch if the connection is closed
       if (abort_connection.aborted) {
-        return;
+        return null;
       }
+      if (isBatchEnd(chunk)) {
+        // This replaces any other has_more value, since the batch end is the last chunk.
+        has_more = chunk.hasMore;
+        break;
+      }
+      const { chunkData: r, targetOp } = chunk;
       if (r.has_more) {
         has_more = true;
       }
-      if (targetOp != null && targetOp > checkpoint) {
+      if (targetOp != null && targetOp > checkpoint.checkpoint) {
         checkpointInvalidated = true;
       }
       if (r.data.length == 0) {
+        // An empty chunk is not sent to the client, but may still report progress:
+        // storage can emit an empty chunk for a bucket that has no operations in the
+        // requested range, and its position must advance so the bucket is not
+        // re-requested indefinitely.
+        checkpointLine.updateBucketPosition({
+          bucket: r.bucket,
+          nextAfter: BigInt(r.next_after),
+          hasMore: r.has_more
+        });
         continue;
       }
       logger.debug(`Sending data for ${r.bucket}`);
@@ -393,7 +542,7 @@ async function* bucketDataBatch(request: BucketDataRequest): AsyncGenerator<Buck
       // Check if syncing bucket data is supposed to stop before fetching more data
       // from storage.
       if (abort_batch.aborted) {
-        return;
+        return null;
       }
     }
 
@@ -403,34 +552,49 @@ async function* bucketDataBatch(request: BucketDataRequest): AsyncGenerator<Buck
         // Don't send the checkpoint_complete line in this case.
         // More data should be available immediately for a new checkpoint.
         yield { data: null, done: true };
+        return { result: 'invalidated', invalidationReason: 'compacted' };
       } else {
         if (request.forPriority != null) {
           const line: util.StreamingSyncCheckpointPartiallyComplete = {
             partial_checkpoint_complete: {
-              last_op_id: util.internalToExternalOpId(checkpoint),
+              last_op_id: util.internalToExternalOpId(checkpoint.checkpoint),
               priority: request.forPriority
             }
           };
           yield { data: line, done: true };
+          return { result: 'partial_checkpoint_complete' };
         } else {
           const line: util.StreamingSyncCheckpointComplete = {
             checkpoint_complete: {
-              last_op_id: util.internalToExternalOpId(checkpoint)
+              last_op_id: util.internalToExternalOpId(checkpoint.checkpoint)
             }
           };
           yield { data: line, done: true };
+          return { result: 'checkpoint_complete' };
         }
       }
     }
   } finally {
-    if (value <= 3) {
-      // This can be noisy, so we only log when we get close to the
-      // concurrency limit.
-      logger.info(`Releasing sync lock`, {
-        user_id: request.userIdForLogs
-      });
-    }
     release();
+  }
+  return null;
+}
+
+function getCheckpointTraceTimings(span: Span): CheckpointTiming {
+  const timings = span.end();
+  const result: CheckpointTiming = {};
+  for (let key in timings) {
+    addTiming(result, key, timings[key]);
+  }
+  addTiming(result, 'other', span.selfDuration);
+  addTiming(result, 'total', span.endAt - span.startAt);
+  return result;
+}
+
+function addTiming(timings: CheckpointTiming, key: string, durationMicros: number) {
+  const ms = Math.round(durationMicros / 1000);
+  if (ms > 0) {
+    timings[key] = (timings[key] ?? 0) + ms;
   }
 }
 

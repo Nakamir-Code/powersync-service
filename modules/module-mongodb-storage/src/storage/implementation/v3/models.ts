@@ -1,15 +1,26 @@
-import { InternalOpId, SerializedSyncPlan, SyncRuleState } from '@powersync/service-core';
-import { BucketDefinitionId, ParameterIndexId } from '@powersync/service-sync-rules';
-import * as bson from 'bson';
-import { BucketDataDoc, BucketKey } from '../common/BucketDataDoc.js';
 import {
-  BucketDataDocumentBase,
+  InternalOpId,
+  JsonValue,
+  PersistedDefinitionMapping,
+  SerializedSyncPlan,
+  SyncRuleState,
+  deserializeParameterLookup as deserializeParameterLookupCore
+} from '@powersync/service-core';
+import {
+  BucketDefinitionId,
+  EventDefinitionId,
+  ParameterIndexId,
+  ScopedParameterLookup,
+  SqliteJsonValue
+} from '@powersync/service-sync-rules';
+import * as bson from 'bson';
+import {
   BucketDataKey,
   BucketParameterDocumentBase,
-  BucketStateDocumentBase,
   CurrentBucket,
+  OpType,
   ReplicaId,
-  SourceTableDocument,
+  SourceTableDocumentSnapshotStatus,
   SourceTableKey,
   SyncRuleCheckpointFields,
   SyncRuleDocumentBase,
@@ -19,7 +30,7 @@ import {
 /**
  * Embedded in sync_rules.sync_configs.
  */
-export interface SyncRuleConfigStateV3 extends SyncRuleCheckpointFields<bigint | null> {
+export interface SyncRuleConfigStateV3 extends SyncRuleCheckpointFields {
   _id: bson.ObjectId;
 
   /**
@@ -47,6 +58,31 @@ export interface ReplicationStreamDocumentV3 extends SyncRuleDocumentBase {
    * but the model allows multiple configs in any state.
    */
   sync_configs: SyncRuleConfigStateV3[];
+
+  /**
+   * The monotonic head of the stream's op sequence: the highest op id persisted to bucket data,
+   * whether or not yet covered by a checkpoint.
+   *
+   * This is shared across all sync configs of the stream (they share the global op sequence).
+   * It is never cleared, only `$max`-advanced. A newly-appended config that replicates nothing
+   * adopts this value as its checkpoint rather than starting at 0.
+   *
+   * Stored as a mongo Long, nullable.
+   */
+  last_persisted_op?: bigint | null;
+
+  /**
+   * The stream's replication position: all source changes up to this LSN have been processed,
+   * and the resulting ops persisted. Replication resumes from here.
+   *
+   * Like {@link last_persisted_op}, this is shared across all sync configs of the stream -
+   * per-config last_checkpoint_lsn values are consistency markers, not replication positions.
+   *
+   * Set via setResumeLsn() (snapshot start, and per-batch progress during streaming), and
+   * advanced on every commit/keepalive - including checkpoint-blocked ones, since commit
+   * flushes first and blocking only delays consistency markers, not data persistence.
+   */
+  resume_lsn?: string | null;
 }
 
 /**
@@ -59,7 +95,7 @@ export interface SyncConfigDefinition {
   created_at: Date;
   storage_version: number;
   /**
-   * The related SyncRuleDocumentV3.
+   * The related ReplicationStreamDocumentV3.
    *
    * Note that a specific sync config definition never moves between replication streams. Instead, we can create a new copy for the new replication stream.
    *
@@ -68,18 +104,11 @@ export interface SyncConfigDefinition {
   replication_stream_id: number;
 
   content: string;
+  /** Optional operator-supplied label identifying this sync config version. */
+  version_label?: string;
   serialized_plan?: SerializedSyncPlan | null;
 
-  rule_mapping: {
-    /**
-     * Map of uniqueName -> id, unique per replication stream.
-     */
-    definitions: Record<string, string>;
-    /**
-     * Map of (lookupName, queryId) -> id, unique per replication stream.
-     */
-    parameter_indexes: Record<string, string>;
-  };
+  rule_mapping: PersistedDefinitionMapping;
 }
 
 export interface CurrentBucketV3 extends CurrentBucket {
@@ -108,57 +137,198 @@ export interface BucketParameterDocumentV3 extends BucketParameterDocumentBase<S
 
 export type BucketDataKeyV3 = BucketDataKey;
 
-export interface BucketDataDocumentV3 extends BucketDataDocumentBase {
-  _id: BucketDataKeyV3;
-}
-
-export function serializeBucketDataV3(document: BucketDataDoc): BucketDataDocumentV3 {
-  const { bucketKey, o } = document;
-  return {
-    _id: {
-      b: bucketKey.bucket,
-      o: o
-    },
-    // List fields directly, so that we don't accidentally persist any unknown fields
-    op: document.op,
-    source_table: document.source_table,
-    source_key: document.source_key,
-    table: document.table,
-    row_id: document.row_id,
-    checksum: document.checksum,
-    data: document.data,
-    target_op: document.target_op
-  };
-}
-
-export function loadBucketDataDocumentV3(
-  context: Pick<BucketKey, 'replicationStreamId' | 'definitionId'>,
-  doc: BucketDataDocumentV3
-): BucketDataDoc {
-  const { _id, ...rest } = doc;
-  return {
-    bucketKey: {
-      ...context,
-      bucket: _id.b
-    },
-    o: _id.o,
-    ...rest
-  };
-}
-
 export function taggedBucketParameterDocumentToV3(document: TaggedBucketParameterDocument): BucketParameterDocumentV3 {
   const { index: _index, ...rest } = document;
   return rest as BucketParameterDocumentV3;
 }
 
-export interface SourceTableDocumentV3 extends SourceTableDocument {
-  bucket_data_source_ids: BucketDefinitionId[];
-  parameter_lookup_source_ids: ParameterIndexId[];
-  latest_pending_delete?: InternalOpId | undefined;
+export interface ReplicaIdColumn {
+  name: string;
+  type_oid?: number;
+  type?: string;
 }
 
-export interface BucketStateDocumentV3 extends BucketStateDocumentBase {
-  _id: BucketStateDocumentBase['_id'] & {
+export interface SourceTableDocumentV3 {
+  _id: bson.ObjectId;
+  connection_id: number;
+  relation_id: number | string | undefined;
+  schema_name: string;
+  table_name: string;
+  replica_id_columns: ReplicaIdColumn[];
+  snapshot_done: boolean;
+  snapshot_status: SourceTableDocumentSnapshotStatus | undefined;
+  bucket_data_source_ids: BucketDefinitionId[];
+  parameter_lookup_source_ids: ParameterIndexId[];
+  /**
+   * Stream-local ids of the compiled event definitions evaluated by this source table.
+   */
+  event_definition_ids: EventDefinitionId[];
+  latest_pending_delete?: InternalOpId | undefined;
+  /**
+   * Source-specific metadata. Absent for legacy records.
+   */
+  source_metadata?: JsonValue;
+}
+
+export interface BucketStateDocumentV3 {
+  _id: {
+    b: string;
     d: BucketDefinitionId;
   };
+
+  /** Must always identify an actual operation in this logical stream. */
+  last_op: bigint;
+
+  /** The next time a compact worker should inspect this bucket. */
+  next_compact_check: Date | undefined;
+  /**
+   * Scheduling epoch for work not covered by a full compact. Writers set the
+   * first actual write time; a partial full compact advances it to completion.
+   */
+  first_uncompacted_write: Date | undefined;
+
+  /**
+   * A checksum cache and the statistics captured by the latest compact (full
+   * or chunk). Keeping these separate from bucket_stats lets writers only
+   * update one set of counters.
+   */
+  compacted_state?: {
+    op_id: InternalOpId;
+    checksum: bigint;
+    count: number;
+    bytes: bigint;
+    at: Date;
+    chunks: number;
+  };
+
+  /** Statistics for the prefix covered by the most recent full compact. */
+  last_full_compact?: {
+    op_id: InternalOpId;
+    count: number;
+    at: Date;
+    puts: number;
+  };
+
+  /** Current aggregate bucket statistics, maintained by writers and compactors. */
+  bucket_stats: {
+    count: number;
+    bytes: bigint;
+    chunks: number;
+  };
+
+  /** A short-lived ownership marker used to distribute bucket compaction. */
+  compact_lease?: {
+    expires_at: Date;
+    id: unknown;
+  };
+}
+
+export interface BucketOperation {
+  o: bigint;
+  op: OpType;
+  source_table?: bson.ObjectId;
+  source_key?: ReplicaId;
+  subkey?: string;
+  table?: string;
+  row_id?: string;
+  checksum: bigint;
+  data: string | null;
+}
+
+export interface StorageRef {
+  path: string;
+  file_size: number;
+}
+
+export interface ObjectStorageUsageDocument {
+  _id: {
+    g: number;
+    w: string;
+  };
+  updated_at: Date;
+  definitions: Record<BucketDefinitionId, bigint>;
+}
+
+/** An S3 object that may be deleted once its grace period has elapsed. */
+export interface ObjectStorageDeletionMarker {
+  _id: bson.ObjectId;
+  path: string;
+  delete_after: Date;
+}
+
+/**
+ * A non-empty chunk of a bucket's ordered operation stream.
+ *
+ * All writers maintain these invariants:
+ *
+ * - `ops` is non-empty and strictly ordered by `o`.
+ * - `min_op` is `ops[0].o` and `_id.o` is `ops[ops.length - 1].o`.
+ * - Documents for the same bucket have ordered, disjoint operation ranges,
+ *   although gaps between ranges are allowed.
+ * - `checksum` is the sum of every operation checksum and `count` is
+ *   `ops.length`.
+ *
+ * Metadata-only checksum and data queries rely on these invariants to identify
+ * boundary-straddling documents without reading `ops`.
+ */
+export interface BucketDataDocumentV3 {
+  _id: BucketDataKey;
+  min_op: bigint;
+  checksum: bigint;
+  count: number;
+  size: number;
+  /**
+   * The greatest operation boundary that influenced this document's contents.
+   * Bucket-data reads propagate it so serving an earlier checkpoint can be
+   * invalidated when compaction changed the operations being returned.
+   */
+  target_op?: bigint | null;
+  ops?: BucketOperation[];
+  storage_ref?: StorageRef;
+  /**
+   * Present (and always true) when this document contains a CLEAR operation.
+   * In that case, this is the first document in the bucket: all preceding
+   * documents have been removed.
+   */
+  has_clear_op?: true;
+}
+
+/**
+ * v3 Custom checkpoints (new name for legacy write checkpoints) are related to
+ * a replication stream and a specific event (in a sync config) which created them.
+ * Unchanged events, between sync configs, can share the documents.
+ * For v3, we store each replication stream's custom checkpoint requests in their own collection:
+ * `custom_checkpoint_requests_${replicationStreamId}_${eventId}`
+ */
+export interface CustomCheckpointRequestDocumentV3 {
+  _id: bson.ObjectId;
+  user_id: string;
+  checkpoint: bigint;
+  /**
+   * Unlike managed write checkpoints, custom write checkpoints are flushed together with
+   * normal ops. This means we can assign an op_id for ordering / correlating with read checkpoints.
+   *
+   * This is not unique - multiple write checkpoints can have the same op_id.
+   */
+  op_id?: InternalOpId;
+  /**
+   * Set when this checkpoint was created from a client-supplied checkpoint
+   * request rather than a persistent custom write checkpoint.
+   */
+  checkpoint_requested_at?: Date | null;
+}
+
+export function serializeParameterLookup(lookup: ScopedParameterLookup): bson.Binary {
+  return new bson.Binary(bson.serialize({ l: lookup.values.slice(2) }));
+}
+
+export function deserializeParameterLookup(lookup: bson.Binary, indexId: ParameterIndexId): SqliteJsonValue[] {
+  return [indexId, '', ...deserializeParameterLookupCore(lookup)];
+}
+
+export function taggedBucketParameterDocumentToTagged(
+  document: TaggedBucketParameterDocument
+): BucketParameterDocumentV3 {
+  const { index: _index, ...rest } = document;
+  return rest as BucketParameterDocumentV3;
 }

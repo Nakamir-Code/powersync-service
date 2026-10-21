@@ -137,6 +137,7 @@ bucket_definitions:
         priority: 3
       }
     ]);
+    expect(line.bucketDataRequestHint).toEqual('bulk');
     // This is the bucket data to be fetched
     expect(bucketStarts(line.getFilteredBucketPositions())).toEqual(new Map([['1#global[]', 0n]]));
 
@@ -169,6 +170,45 @@ bucket_definitions:
         write_checkpoint: undefined
       }
     });
+    expect(bucketStarts(line2.getFilteredBucketPositions())).toEqual(new Map([['1#global[]', 1n]]));
+    expect(line2.bucketDataRequestHint).toEqual('incremental');
+  });
+
+  test('unfinished bulk bucket does not make checkpoint diff bulk', async () => {
+    const storage = new MockBucketChecksumStateStorage();
+    storage.updateTestChecksum({ bucket: '1#global[]', checksum: 1, count: 1 });
+
+    const state = new BucketChecksumState({
+      syncContext,
+      syncRequest,
+      tokenPayload,
+      syncRules: SYNC_RULES_GLOBAL,
+      bucketStorage: storage
+    });
+
+    const line = (await state.buildNextCheckpointLine({
+      base: storage.makeCheckpoint(1n),
+      writeCheckpoint: null,
+      update: CHECKPOINT_INVALIDATE_ALL
+    }))!;
+    line.advance();
+    line.updateBucketPosition({ bucket: '1#global[]', nextAfter: 1n, hasMore: true });
+
+    storage.updateTestChecksum({ bucket: '1#global[]', checksum: 2, count: 2 });
+
+    const line2 = (await state.buildNextCheckpointLine({
+      base: storage.makeCheckpoint(2n),
+      writeCheckpoint: null,
+      update: {
+        updatedDataBuckets: new Set(['1#global[]']),
+        invalidateDataBuckets: false,
+        updatedParameterLookups: new Set(),
+        invalidateParameterBuckets: false
+      }
+    }))!;
+    line2.advance();
+
+    expect(line2.bucketDataRequestHint).toEqual('incremental');
     expect(bucketStarts(line2.getFilteredBucketPositions())).toEqual(new Map([['1#global[]', 1n]]));
   });
 
@@ -679,6 +719,195 @@ config:
       storage.updateTestChecksum({ bucket: '1#stream|0["b"]', checksum: 1, count: 1 });
     });
 
+    // Auto-subscription includes profiles in both cases. The explicit subscription adds another
+    // inclusion reason and overrides priority 3 with priority 1; it does not enable the stream.
+    test.each([false, true])(
+      'fetches overlapping static and dynamic buckets only once (custom subscription: %s)',
+      async (subscribe) => {
+        // Alice's profile is selected directly through auth.user_id() and also
+        // through her membership in her own group. Both branches resolve to the same bucket.
+        const state = checksumState(
+          /* yaml */ `
+            # Select the same profile through static and dynamic parameters.
+            config:
+              edition: 3
+            streams:
+              profiles:
+                auto_subscribe: true
+                query: |
+                  SELECT id, name FROM profiles
+                  WHERE id = auth.user_id()
+                     OR id IN (SELECT member_id FROM memberships WHERE owner_id = auth.user_id())
+          `,
+          {
+            tokenPayload: new JwtPayload({ sub: 'alice' }),
+            syncRequest: {
+              streams: {
+                subscriptions: subscribe ? [{ stream: 'profiles', parameters: null, override_priority: 1 }] : []
+              }
+            }
+          }
+        );
+        const bucket = '1#profiles|0["alice"]';
+        storage.updateTestChecksum({ bucket, checksum: 1, count: 1 });
+
+        const line = (await state.buildNextCheckpointLine({
+          // Supply the membership lookup result without a database. '0' is the generated
+          // output column for member_id in the compiled parameter query.
+          base: storage.makeCheckpoint(1n, (lookups) => [{ lookup: lookups[0], rows: [{ '0': 'alice' }] }]),
+          writeCheckpoint: null,
+          update: CHECKPOINT_INVALIDATE_ALL
+        }))!;
+        line.advance();
+
+        // Check the request arrays directly: converting them to a Map would hide duplicates.
+        // Postgres fetches operations once per request, so duplicates here duplicate the data.
+        expect(line.bucketsToFetch.map((description) => description.bucket)).toEqual([bucket]);
+        expect(line.getFilteredBucketPositions().map((request) => request.bucket)).toEqual([bucket]);
+        // Merging must retain the default and any explicit subscription, using the lowest
+        // numeric priority (the highest sync priority) among them.
+        expect(line.checkpointLine).toMatchObject({
+          checkpoint: {
+            buckets: [
+              {
+                bucket,
+                checksum: 1,
+                count: 1,
+                priority: subscribe ? 1 : 3,
+                subscriptions: expect.arrayContaining(subscribe ? [{ default: 0 }, { sub: 0 }] : [{ default: 0 }])
+              }
+            ]
+          }
+        });
+
+        // Only bucket data changes at this checkpoint, so reuse the cached membership result.
+        // The first download is still pending; its next fetch must also contain only one request.
+        // Incremental requests are already deduplicated by a Set, so also check the description:
+        // it must retain the inclusion reasons from both the static and cached dynamic matches.
+        storage.updateTestChecksum({ bucket, checksum: 2, count: 2 });
+        const cachedLine = (await state.buildNextCheckpointLine({
+          base: storage.makeCheckpoint(2n),
+          writeCheckpoint: null,
+          update: {
+            invalidateDataBuckets: false,
+            invalidateParameterBuckets: false,
+            updatedDataBuckets: new Set([bucket]),
+            updatedParameterLookups: new Set()
+          }
+        }))!;
+        cachedLine.advance();
+        expect(cachedLine.getFilteredBucketPositions().map((request) => request.bucket)).toEqual([bucket]);
+        expect(cachedLine.bucketsToFetch).toMatchObject([
+          {
+            bucket,
+            priority: subscribe ? 1 : 3,
+            inclusion_reasons: expect.arrayContaining(subscribe ? ['default', { subscription: 0 }] : ['default'])
+          }
+        ]);
+        expect(cachedLine.checkpointLine).toMatchObject({
+          checkpoint_diff: {
+            updated_buckets: [
+              {
+                bucket,
+                checksum: 2,
+                count: 2,
+                priority: subscribe ? 1 : 3,
+                subscriptions: expect.arrayContaining(subscribe ? [{ default: 0 }, { sub: 0 }] : [{ default: 0 }])
+              }
+            ]
+          }
+        });
+
+        // Simulate Alice leaving the group by returning no membership rows. The direct auth
+        // match must keep her bucket. Change its checksum so a new checkpoint line is emitted.
+        storage.updateTestChecksum({ bucket, checksum: 3, count: 3 });
+        const staticLine = (await state.buildNextCheckpointLine({
+          base: storage.makeCheckpoint(3n, (lookups) => lookups.map((lookup) => ({ lookup, rows: [] }))),
+          writeCheckpoint: null,
+          update: CHECKPOINT_INVALIDATE_ALL
+        }))!;
+        staticLine.advance();
+        expect(staticLine.getFilteredBucketPositions().map((request) => request.bucket)).toEqual([bucket]);
+      }
+    );
+
+    test('preserves static subscription metadata when a dynamic match overlaps', async () => {
+      const state = checksumState(
+        /* yaml */ `
+          # The explicit subscription contributes priority through its static match.
+          config:
+            edition: 3
+          streams:
+            profiles:
+              auto_subscribe: true
+              query: |
+                SELECT id, name FROM profiles
+                WHERE id = auth.user_id()
+                   OR id IN (
+                     SELECT member_id FROM memberships
+                     WHERE owner_id = ifnull(subscription.parameter('owner_id'), auth.user_id())
+                   )
+        `,
+        {
+          tokenPayload: new JwtPayload({ sub: 'alice' }),
+          syncRequest: {
+            streams: {
+              subscriptions: [{ stream: 'profiles', parameters: { owner_id: 'bob' }, override_priority: 1 }]
+            }
+          }
+        }
+      );
+      const bucket = '1#profiles|0["alice"]';
+
+      // Both subscriptions select Alice statically, but only the default subscription finds
+      // her through memberships. Keeping only the dynamic description would lose sub: 0 and
+      // its priority override. Check both the initial and cached incremental checkpoints.
+      for (const checkpoint of [1n, 2n]) {
+        storage.updateTestChecksum({ bucket, checksum: Number(checkpoint), count: Number(checkpoint) });
+        const line = (await state.buildNextCheckpointLine({
+          base: storage.makeCheckpoint(
+            checkpoint,
+            checkpoint === 1n
+              ? (lookups) =>
+                  lookups.map((lookup) => ({
+                    lookup,
+                    rows: lookup.values.includes('alice') ? [{ '0': 'alice' }] : []
+                  }))
+              : undefined
+          ),
+          writeCheckpoint: null,
+          update:
+            checkpoint === 1n
+              ? CHECKPOINT_INVALIDATE_ALL
+              : {
+                  invalidateDataBuckets: false,
+                  invalidateParameterBuckets: false,
+                  updatedDataBuckets: new Set([bucket]),
+                  updatedParameterLookups: new Set()
+                }
+        }))!;
+        line.advance();
+        expect(line.bucketsToFetch).toMatchObject([
+          {
+            bucket,
+            priority: 1,
+            inclusion_reasons: expect.arrayContaining(['default', { subscription: 0 }])
+          }
+        ]);
+        const descriptions =
+          'checkpoint' in line.checkpointLine
+            ? line.checkpointLine.checkpoint.buckets
+            : line.checkpointLine.checkpoint_diff.updated_buckets;
+        expect(descriptions).toMatchObject([
+          {
+            bucket,
+            priority: 1,
+            subscriptions: expect.arrayContaining([{ default: 0 }, { sub: 0 }])
+          }
+        ]);
+      }
+    });
+
     test('includes defaults', async () => {
       const state = checksumState(true);
       const line = await state.buildNextCheckpointLine({
@@ -1143,7 +1372,7 @@ streams:
       ).rejects.toThrow('Too many buckets: 60 (limit of 50');
 
       // Verify error log includes breakdown
-      expect(errorMessages[0]).toContain('Buckets by definition:');
+      expect(errorMessages[0]).toContain('(limit of 50)\nBuckets by Sync Stream:');
       expect(errorMessages[0]).toContain('projects: 30');
       expect(errorMessages[0]).toContain('tasks: 20');
       expect(errorMessages[0]).toContain('comments: 10');
@@ -1157,15 +1386,60 @@ streams:
       });
     });
 
-    test('limits bucket breakdown to top 10 definitions', async () => {
-      // Create sync streams with 15 different definitions with dynamic parameters
+    test('labels the bucket breakdown as bucket definitions for legacy sync rules', async () => {
+      const legacySyncRules = SqlSyncRules.fromYaml(
+        `
+bucket_definitions:
+  projects:
+    parameters: SELECT id FROM projects WHERE user_id = request.user_id()
+    data: []
+    `,
+        { defaultSchema: 'public' }
+      ).config.hydrate({ hydrationState: versionedHydrationState(5), sqlite: nodeSqlite(sqlite) });
+
+      const storage = new MockBucketChecksumStateStorage();
+      const errorMessages: string[] = [];
+      const state = new BucketChecksumState({
+        syncContext: new SyncContext({
+          maxBuckets: 50,
+          maxParameterQueryResults: 100,
+          maxDataFetchConcurrency: 10
+        }),
+        tokenPayload: new JwtPayload({ sub: 'u1' }),
+        syncRequest,
+        syncRules: legacySyncRules,
+        bucketStorage: storage,
+        logger: {
+          info: () => {},
+          error: (message: string) => errorMessages.push(message),
+          warn: () => {},
+          debug: () => {}
+        } as any
+      });
+
+      await expect(
+        state.buildNextCheckpointLine({
+          base: storage.makeCheckpoint(1n, (lookups) => [
+            { lookup: lookups[0], rows: Array.from({ length: 60 }, (_, id) => ({ id })) }
+          ]),
+          writeCheckpoint: null,
+          update: CHECKPOINT_INVALIDATE_ALL
+        })
+      ).rejects.toThrow('Too many buckets: 60 (limit of 50)');
+
+      expect(errorMessages[0]).toContain('(limit of 50)\nBuckets by bucket definition:');
+      expect(errorMessages[0]).toContain('projects: 60');
+    });
+
+    test('limits bucket breakdown to top 100 Sync Streams', async () => {
+      // Create 105 Sync Streams with dynamic parameters.
       let yamlDefinitions = `
 config:
   edition: 3
 
 streams:
 `;
-      for (let i = 1; i <= 15; i++) {
+      for (let i = 1; i <= 105; i++) {
         yamlDefinitions += `  def${i}:\n`;
         yamlDefinitions += `    auto_subscribe: true\n`;
         yamlDefinitions += `    query: SELECT * FROM tbl WHERE b = auth.parameter('${i}')\n`;
@@ -1189,7 +1463,7 @@ streams:
       };
 
       const smallContext = new SyncContext({
-        maxBuckets: 10,
+        maxBuckets: 100,
         maxParameterQueryResults: 10,
         maxDataFetchConcurrency: 10
       });
@@ -1198,7 +1472,7 @@ streams:
         syncContext: smallContext,
         tokenPayload: new JwtPayload({
           sub: 'u1',
-          ...Object.fromEntries(Array.from({ length: 30 }, (_, i) => [i.toString(), BigInt(i)]))
+          ...Object.fromEntries(Array.from({ length: 106 }, (_, i) => [i.toString(), BigInt(i)]))
         }),
         syncRequest,
         syncRules: SYNC_RULES_MANY,
@@ -1212,15 +1486,16 @@ streams:
           writeCheckpoint: null,
           update: CHECKPOINT_INVALIDATE_ALL
         })
-      ).rejects.toThrow('Too many buckets: 15 (limit of 10)');
+      ).rejects.toThrow('Too many buckets: 105 (limit of 100)');
 
-      // Verify only top 10 are shown
+      // Verify only the first 100 are shown.
       const errorMessage = errorMessages[0];
-      expect(errorMessage).toContain('... and 5 more results from 5 definitions');
+      expect(errorMessage).toContain('Buckets by Sync Stream:');
+      expect(errorMessage).toContain('... and 5 more buckets from 5 Sync Streams');
 
-      // Count how many definitions are listed (should be exactly 10)
+      // Count how many Sync Streams are listed (should be exactly 100).
       const defMatches = errorMessage.match(/def\d+:/g);
-      expect(defMatches?.length).toBe(10);
+      expect(defMatches?.length).toBe(100);
     });
   });
 });
@@ -1240,7 +1515,7 @@ class MockBucketChecksumStateStorage implements BucketChecksumStateStorage {
     this.filter?.({ invalidate: true });
   }
 
-  async getChecksums(_checkpoint: InternalOpId, buckets: { bucket: string }[]): Promise<ChecksumMap> {
+  async getChecksums(_checkpoint: ReplicationCheckpoint, buckets: { bucket: string }[]): Promise<ChecksumMap> {
     return new Map<string, BucketChecksum>(
       buckets.map(({ bucket }) => {
         const checksum = this.state.get(bucket);

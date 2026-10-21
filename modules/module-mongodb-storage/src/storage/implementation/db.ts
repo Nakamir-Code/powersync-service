@@ -17,6 +17,7 @@ import {
   SyncRuleDocumentBase,
   WriteCheckpointDocument
 } from './models.js';
+import { MongoWriteBatch } from './MongoWriteBatch.js';
 import {
   BucketDataDocumentV1,
   BucketParameterDocument,
@@ -24,8 +25,9 @@ import {
   CurrentDataDocument
 } from './v1/models.js';
 import { VersionedPowerSyncMongoV1 } from './v1/VersionedPowerSyncMongoV1.js';
-import { BucketDataDocumentV3 } from './v3/models.js';
-import { VersionedPowerSyncMongoV3 } from './v3/VersionedPowerSyncMongoV3.js';
+import { BucketDataDocumentV3, CustomCheckpointRequestDocumentV3 } from './v3/models.js';
+import type { CustomCheckpointRequestCollectionSpecifier } from './v3/VersionedPowerSyncMongoV3.js';
+import { OBJECT_STORAGE_USAGE_COLLECTION, VersionedPowerSyncMongoV3 } from './v3/VersionedPowerSyncMongoV3.js';
 
 export interface PowerSyncMongoOptions {
   /**
@@ -53,6 +55,19 @@ export class PowerSyncMongo {
 
   readonly client: mongo.MongoClient;
   readonly db: mongo.Db;
+  private get clientBulkWriteSupport(): boolean {
+    // The driver exposes topology at runtime, but omits this internal property
+    // from its public types. Reuse its handshake results without another command.
+    const client = this.client as mongo.MongoClient & { topology?: { description: mongo.TopologyDescription } };
+    const servers = [...(client.topology?.description.servers.values() ?? [])];
+    // MongoDB 8.0 introduced client bulkWrite at wire version 25. Unknown / mixed-version
+    // topologies use collection writes until all known servers support it.
+    return servers.length > 0 && servers.every((server) => server.maxWireVersion >= 25);
+  }
+
+  createWriteBatch(session: mongo.ClientSession | undefined, options: { ordered: boolean }): MongoWriteBatch {
+    return new MongoWriteBatch(this.client, this.clientBulkWriteSupport, session, options);
+  }
 
   constructor(client: mongo.MongoClient, options?: PowerSyncMongoOptions) {
     this.client = client;
@@ -66,6 +81,7 @@ export class PowerSyncMongo {
     this.bucket_data = db.collection('bucket_data');
     this.bucket_parameters = db.collection('bucket_parameters');
     this.op_id_sequence = db.collection('op_id_sequence');
+    // Uses legacy terminology instead of "sync config" for backwards-compatibility
     this.sync_rules = db.collection('sync_rules');
     this.source_tables = db.collection('source_tables');
     this.custom_write_checkpoints = db.collection('custom_write_checkpoints');
@@ -81,7 +97,7 @@ export class PowerSyncMongo {
   versioned(storageConfig: StorageConfig & { incrementalReprocessing: false }): VersionedPowerSyncMongoV1;
   versioned(storageConfig: StorageConfig): VersionedPowerSyncMongo;
   versioned(storageConfig: StorageConfig): VersionedPowerSyncMongo {
-    if (storageConfig.incrementalReprocessing) {
+    if (storageConfig.version >= storage.STORAGE_VERSION_3) {
       return new VersionedPowerSyncMongoV3(this, storageConfig);
     }
 
@@ -93,22 +109,18 @@ export class PowerSyncMongo {
    */
   async listBucketDataCollectionsV3(groupId?: number): Promise<mongo.Collection<BucketDataDocumentV3>[]> {
     const prefix = groupId == null ? 'bucket_data_' : `bucket_data_${groupId}_`;
-    const collections = await this.db.listCollections({ name: new RegExp(`^${prefix}`) }, { nameOnly: true }).toArray();
-
-    return collections
-      .filter((collection) => collection.name.startsWith(prefix))
-      .map((collection) => this.db.collection<BucketDataDocumentV3>(collection.name));
+    return this.collectionsByPrefix<BucketDataDocumentV3>(prefix);
   }
 
   /**
    * Not safe for user-provided prefix - only for hardcoded values.
    */
-  private async collectionsByPrefix(prefix: string): Promise<mongo.Collection<never>[]> {
-    const collections = await this.db.listCollections({ name: new RegExp(`^${prefix}`) }, { nameOnly: true }).toArray();
+  private async collectionsByPrefix<T extends mongo.Document = never>(prefix: string): Promise<mongo.Collection<T>[]> {
+    const collections = await this.db.listCollections({ name: { $regex: `^${prefix}` } }, { nameOnly: true }).toArray();
 
     return collections
       .filter((collection) => collection.name.startsWith(prefix))
-      .map((collection) => this.db.collection<never>(collection.name));
+      .map((collection) => this.db.collection<T>(collection.name));
   }
 
   /**
@@ -141,19 +153,29 @@ export class PowerSyncMongo {
     return `source_table_${replicationStreamId}`;
   }
 
+  customCheckpointRequestCollectionName(options: CustomCheckpointRequestCollectionSpecifier) {
+    return `custom_checkpoint_requests_${options.replicationStreamId}_${options.eventId}`;
+  }
+
+  async listCustomCheckpointRequestCollections(
+    replicationStreamId?: number
+  ): Promise<mongo.Collection<CustomCheckpointRequestDocumentV3>[]> {
+    const prefix =
+      replicationStreamId == null
+        ? 'custom_checkpoint_requests_'
+        : `custom_checkpoint_requests_${replicationStreamId}_`;
+    return this.collectionsByPrefix(prefix);
+  }
+
   async listSourceTableCollections(
     replicationStreamId?: number
   ): Promise<mongo.Collection<CommonSourceTableDocument>[]> {
-    const filter =
-      replicationStreamId == null
-        ? { name: new RegExp('^source_table_') }
-        : { name: this.sourceTableCollectionName(replicationStreamId) };
-    const prefix = replicationStreamId == null ? 'source_table_' : this.sourceTableCollectionName(replicationStreamId);
-    const collections = await this.db.listCollections(filter, { nameOnly: true }).toArray();
-
-    return collections
-      .filter((collection) => collection.name.startsWith(prefix))
-      .map((collection) => this.db.collection<CommonSourceTableDocument>(collection.name));
+    if (replicationStreamId == null) {
+      return this.collectionsByPrefix('source_table_');
+    }
+    const name = this.sourceTableCollectionName(replicationStreamId);
+    const collections = await this.db.listCollections({ name }, { nameOnly: true }).toArray();
+    return collections.map((c) => this.db.collection<CommonSourceTableDocument>(c.name));
   }
 
   /**
@@ -186,6 +208,10 @@ export class PowerSyncMongo {
     await this.locks.deleteMany({});
     await this.bucket_state.deleteMany({});
     await this.custom_write_checkpoints.deleteMany({});
+    await this.db.collection(OBJECT_STORAGE_USAGE_COLLECTION).deleteMany({});
+    for (const collection of await this.listCustomCheckpointRequestCollections()) {
+      await collection.drop();
+    }
   }
 
   /**
@@ -203,7 +229,14 @@ export class PowerSyncMongo {
    * This is used in a similar way to the Postgres NOTIFY functionality.
    */
   async notifyCheckpoint() {
-    await this.checkpoint_events.insertOne({} as any, { forceServerObjectId: true });
+    await this.checkpoint_events.insertOne({} as any, {
+      forceServerObjectId: true,
+      // No correctness issue if this write is missed / rolled back.
+      // It could cause some sync delays, that will resolve in at most a minute, but no consistency issues.
+      writeConcern: {
+        w: 1
+      }
+    });
   }
 
   /**

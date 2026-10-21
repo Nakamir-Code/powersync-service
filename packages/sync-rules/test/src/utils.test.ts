@@ -3,6 +3,8 @@ import {
   applyValueContext,
   BucketDataSource,
   CompatibilityContext,
+  CompatibilityEdition,
+  CompatibilityOption,
   DateTimeSourceOptions,
   DateTimeValue,
   mergeBuckets,
@@ -43,6 +45,22 @@ describe('toSyncRulesValue', () => {
     expect(TimeValue.parse('12:13:14.15', sourceOptions)?.toSqliteValue(syncStreams)).toStrictEqual('12:13:14.150');
     expect(TimeValue.parse('12:13:14.15', sourceOptions)?.toSqliteValue(legacy)).toStrictEqual('12:13:14.15');
   });
+
+  test('booleans in json', () => {
+    expect(
+      applyValueContext(toSyncRulesValue([1n, true]), CompatibilityContext.FULL_BACKWARDS_COMPATIBILITY)
+    ).toStrictEqual('[1,1]');
+
+    expect(
+      applyValueContext(
+        toSyncRulesValue([1n, true]),
+        new CompatibilityContext({
+          edition: CompatibilityEdition.COMPILED_STREAMS,
+          overrides: new Map([[CompatibilityOption.fixedBooleanInJson, true]])
+        })
+      )
+    ).toStrictEqual('[1,true]');
+  });
 });
 
 describe('mergeBuckets', () => {
@@ -67,6 +85,33 @@ describe('mergeBuckets', () => {
       {
         definition: 'a',
         inclusion_reasons: ['default', { subscription: 1 }],
+        priority: 2,
+        bucket: 'bkt'
+      }
+    ]);
+  });
+
+  test('deduplicates matching inclusion reasons', () => {
+    const fakeSource: BucketDataSource = null as any;
+    const a: ResolvedBucket = {
+      definition: 'a',
+      inclusion_reasons: ['default', { subscription: 1 }],
+      priority: 3,
+      bucket: 'bkt',
+      source: fakeSource
+    };
+    const b: ResolvedBucket = {
+      definition: 'a',
+      inclusion_reasons: [{ subscription: 1 }, { subscription: 2 }],
+      priority: 2,
+      bucket: 'bkt',
+      source: fakeSource
+    };
+
+    expect(mergeBuckets([a, b])).toStrictEqual([
+      {
+        definition: 'a',
+        inclusion_reasons: ['default', { subscription: 1 }, { subscription: 2 }],
         priority: 2,
         bucket: 'bkt'
       }

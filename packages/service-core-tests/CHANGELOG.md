@@ -1,5 +1,146 @@
 # @powersync/service-core-tests
 
+## 0.18.4
+
+### Patch Changes
+
+- Updated dependencies [44ce423]
+- Updated dependencies [51a1a89]
+- Updated dependencies [e703ca5]
+- Updated dependencies [324093e]
+- Updated dependencies [286b0f8]
+- Updated dependencies [57ef2f4]
+- Updated dependencies [6700c71]
+  - @powersync/service-sync-rules@0.44.0
+  - @powersync/service-core@1.27.1
+  - @powersync/lib-services-framework@0.10.4
+
+## 0.18.3
+
+### Patch Changes
+
+- 5078032: Change the default MongoDB storage version from 2 to 4.
+- Updated dependencies [0483d4e]
+- Updated dependencies [28f024b]
+- Updated dependencies [5078032]
+- Updated dependencies [424bbc0]
+- Updated dependencies [e87703a]
+- Updated dependencies [b70f467]
+- Updated dependencies [18f0c95]
+- Updated dependencies [c60db6e]
+- Updated dependencies [0483d4e]
+- Updated dependencies [a8c3f15]
+  - @powersync/service-core@1.27.0
+  - @powersync/service-sync-rules@0.43.0
+  - @powersync/lib-services-framework@0.10.3
+
+## 0.18.2
+
+### Patch Changes
+
+- Updated dependencies [f842b4e]
+- Updated dependencies [5ae6f75]
+  - @powersync/service-core@1.26.1
+  - @powersync/service-sync-rules@0.42.0
+  - @powersync/lib-services-framework@0.10.2
+
+## 0.18.1
+
+### Patch Changes
+
+- a997c88: Restructure MongoDB V3 bucket compacting.
+- Updated dependencies [e11c54b]
+- Updated dependencies [4b6a23e]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [0077a8d]
+- Updated dependencies [332d649]
+- Updated dependencies [33a3c23]
+- Updated dependencies [fccdff2]
+- Updated dependencies [989d9e1]
+- Updated dependencies [646c0de]
+- Updated dependencies [cc121b3]
+- Updated dependencies [4e4063b]
+- Updated dependencies [2407f71]
+- Updated dependencies [10131ca]
+- Updated dependencies [4037e8f]
+- Updated dependencies [3972bac]
+- Updated dependencies [dd7a22f]
+- Updated dependencies [a997c88]
+  - @powersync/service-core@1.26.0
+  - @powersync/service-sync-rules@0.41.0
+  - @powersync/lib-services-framework@0.10.1
+
+## 0.18.0
+
+### Minor Changes
+
+- 2189250: Add `/sync/checkpoint-request` for client-supplied checkpoint request ids, previously called write checkpoint ids. The route returns the stored `checkpoint_request_id`, storage now treats managed request ids as monotonic per user/client, custom checkpoint request ids continue to use the existing `checkpoint` field for backwards compatibility, and `checkpoint_requested_at` metadata lets compact jobs remove expired request-derived checkpoint records.
+
+  This release includes storage migrations for the checkpoint request metadata. Self-hosters should run migrations as part of the upgrade.
+
+### Patch Changes
+
+- 63707af: Stability and performance fixes for MongoDB storage V3.
+- Updated dependencies [087b61e]
+- Updated dependencies [2189250]
+- Updated dependencies [922f974]
+- Updated dependencies [c4860c9]
+- Updated dependencies [483415d]
+- Updated dependencies [8daa300]
+- Updated dependencies [aab068b]
+- Updated dependencies [37591e9]
+- Updated dependencies [be42e25]
+- Updated dependencies [cb4c627]
+  - @powersync/service-core@1.24.0
+  - @powersync/lib-services-framework@0.10.0
+  - @powersync/service-sync-rules@0.40.0
+
+## 0.17.2
+
+### Patch Changes
+
+- Updated dependencies [ea71bf3]
+- Updated dependencies [ea31f64]
+- Updated dependencies [edc6ed4]
+  - @powersync/service-sync-rules@0.39.0
+  - @powersync/service-core@1.23.3
+  - @powersync/lib-services-framework@0.9.8
+
+## 0.17.1
+
+### Patch Changes
+
+- 71d4a0a: Add logs for checkpoint_complete to assist with debugging. Remove "sync lock" logs.
+- e4f683d: [MongoDB Storage] Add experimental option to allow reading data from secondaries.
+- 71d4a0a: Fix edge case where the service can return incomplete data. This could happen when using bucket priorities, and a checkpoint is invalidated by the compact process while syncing.
+- df9ab1e: Batch concurrent write checkpoint requests and increase request limits to improve throughput.
+- Updated dependencies [71d4a0a]
+- Updated dependencies [e4f683d]
+- Updated dependencies [71d4a0a]
+- Updated dependencies [a6ae678]
+- Updated dependencies [c2edf86]
+- Updated dependencies [df9ab1e]
+  - @powersync/service-core@1.23.2
+  - @powersync/service-sync-rules@0.38.1
+  - @powersync/lib-services-framework@0.9.7
+
+## 0.17.0
+
+### Minor Changes
+
+- a91a08f: [Experimental] Enable incremental reprocessing for MongoDB source + MongoDB storage. This includes significant changes to the v3 storage format.
+
+### Patch Changes
+
+- Updated dependencies [a91a08f]
+- Updated dependencies [184c39f]
+- Updated dependencies [c3f75df]
+- Updated dependencies [4bd35ea]
+  - @powersync/service-core@1.23.0
+  - @powersync/service-sync-rules@0.38.0
+  - @powersync/lib-services-framework@0.9.6
+
 ## 0.16.0
 
 ### Minor Changes

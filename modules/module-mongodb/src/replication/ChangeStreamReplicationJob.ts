@@ -3,18 +3,22 @@ import { replication } from '@powersync/service-core';
 
 import { ChangeStream, ChangeStreamInvalidatedError } from './ChangeStream.js';
 import { ConnectionManagerFactory } from './ConnectionManagerFactory.js';
+import { MongoReplicationQueryProviderFactory } from './MongoReplicationQueryProvider.js';
 
 export interface ChangeStreamReplicationJobOptions extends replication.AbstractReplicationJobOptions {
   connectionFactory: ConnectionManagerFactory;
+  createReplicationQueryProvider?: MongoReplicationQueryProviderFactory;
 }
 
 export class ChangeStreamReplicationJob extends replication.AbstractReplicationJob {
-  private connectionFactory: ConnectionManagerFactory;
+  private readonly connectionFactory: ConnectionManagerFactory;
+  private readonly createReplicationQueryProvider: MongoReplicationQueryProviderFactory | undefined;
   private lastStream: ChangeStream | null = null;
 
   constructor(options: ChangeStreamReplicationJobOptions) {
     super(options);
     this.connectionFactory = options.connectionFactory;
+    this.createReplicationQueryProvider = options.createReplicationQueryProvider;
     // We use a custom formatter to process the prefix
     this.logger = options.storage.logger;
   }
@@ -24,7 +28,7 @@ export class ChangeStreamReplicationJob extends replication.AbstractReplicationJ
   }
 
   async keepAlive() {
-    // Nothing needed here
+    await this.lastStream?.keepAlive();
   }
 
   async replicate() {
@@ -47,7 +51,7 @@ export class ChangeStreamReplicationJob extends replication.AbstractReplicationJ
 
       if (e instanceof ChangeStreamInvalidatedError) {
         // This stops replication and restarts with a new instance
-        await this.options.storage.factory.restartReplication(this.storage.group_id);
+        await this.options.storage.factory.restartReplication(this.storage.replicationStreamId);
       }
 
       // No need to rethrow - the error is already logged, and retry behavior is the same on error
@@ -66,13 +70,22 @@ export class ChangeStreamReplicationJob extends replication.AbstractReplicationJ
       if (this.isStopped) {
         return;
       }
-      const stream = new ChangeStream({
-        abort_signal: this.abortController.signal,
-        storage: this.options.storage,
-        metrics: this.options.metrics,
-        connections: connectionManager,
-        logger: this.logger
-      });
+      let stream: ChangeStream;
+      try {
+        stream = new ChangeStream({
+          abort_signal: this.abortController.signal,
+          storage: this.options.storage,
+          metrics: this.options.metrics,
+          connections: connectionManager,
+          keepaliveIntervalMs: connectionManager.options.heartbeat_interval_seconds * 1_000,
+          logger: this.logger,
+          createReplicationQueryProvider: this.createReplicationQueryProvider
+        });
+      } catch (error) {
+        // Construction can fail before ChangeStream.replicate() reports errors.
+        await this.storage.reportError(error);
+        throw error;
+      }
       this.lastStream = stream;
       await stream.replicate();
     } finally {

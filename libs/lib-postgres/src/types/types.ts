@@ -24,7 +24,7 @@ export const BasePostgresConnectionConfig = t.object({
   database: t.string.optional(),
 
   /** Defaults to verify-full */
-  sslmode: t.literal('verify-full').or(t.literal('verify-ca')).or(t.literal('disable')).optional(),
+  sslmode: service_types.enumLiteral('verify-full', 'verify-ca', 'disable').optional(),
   /** Required for verify-ca, optional for verify-full */
   cacert: t.string.optional(),
 
@@ -42,7 +42,7 @@ export const BasePostgresConnectionConfig = t.object({
   reject_ip_ranges: t.array(t.string).optional(),
 
   /**
-   * Prefix for the slot name. Defaults to "powersync_"
+   * Prefix for Postgres logical replication slot names, as well as replication stream names. Defaults to "powersync_"
    */
   slot_name_prefix: t.string.optional(),
 

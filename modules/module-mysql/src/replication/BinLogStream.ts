@@ -27,8 +27,8 @@ import { MySQLConnectionManager } from './MySQLConnectionManager.js';
 import { BinLogEventHandler, BinLogListener, Row, SchemaChange, SchemaChangeType } from './zongji/BinLogListener.js';
 
 export interface BinLogStreamOptions {
-  connections: MySQLConnectionManager;
   storage: storage.SyncRulesBucketStorage;
+  connections: MySQLConnectionManager;
   metrics: MetricsEngine;
   abortSignal: AbortSignal;
   logger?: Logger;
@@ -73,16 +73,20 @@ export class BinLogStream {
 
   private readonly logger: Logger;
 
+  private activeServerUuid: string | null = null;
+
   private tableCache = new Map<string | number, storage.SourceTable[]>();
 
   private replicationLag = new ReplicationLagTracker();
+
+  private binLogListener: BinLogListener | null = null;
 
   constructor(private options: BinLogStreamOptions) {
     this.logger = options.logger ?? defaultLogger;
     this.storage = options.storage;
     this.connections = options.connections;
     this.syncRules = options.storage.getParsedSyncRules({ defaultSchema: this.defaultSchema });
-    this.groupId = options.storage.group_id;
+    this.groupId = options.storage.replicationStreamId;
     this.abortSignal = options.abortSignal;
   }
 
@@ -215,21 +219,28 @@ export class BinLogStream {
    */
   protected async checkInitialReplicated(): Promise<boolean> {
     const status = await this.storage.getStatus();
-    const lastKnowGTID = status.checkpoint_lsn ? common.ReplicatedGTID.fromSerialized(status.checkpoint_lsn) : null;
-    if (status.snapshot_done && status.checkpoint_lsn) {
+    const lastKnowGTID = status.resumeLsn ? common.ReplicatedGTID.fromSerialized(status.resumeLsn) : null;
+    if (status.snapshotDone) {
       this.logger.info(`Initial replication already done.`);
 
       if (lastKnowGTID) {
-        // Check if the specific binlog file is still available. If it isn't, we need to snapshot again.
         const connection = await this.connections.getConnection();
         try {
-          const isAvailable = await common.isBinlogStillAvailable(connection, lastKnowGTID.position.filename);
+          // Check if the active server uuid matches the one in the GTID
+          if (this.activeServerUuid !== lastKnowGTID.serverUuid) {
+            this.logger.info(
+              `The source server uuid has changed. Active server uuid ${this.activeServerUuid} does not match the server uuid from the resume checkpoint: ${lastKnowGTID.serverUuid}, re-snapshotting to ensure consistency.`
+            );
+            return false;
+          }
+
+          const isAvailable = await common.isGtidPositionStillAvailable(connection, lastKnowGTID);
           if (!isAvailable) {
             this.logger.info(
-              `BinLog file ${lastKnowGTID.position.filename} is no longer available, starting initial replication again.`
+              `Resume GTID ${lastKnowGTID.raw} at ${lastKnowGTID.position.filename}:${lastKnowGTID.position.offset} is no longer present in the executed GTID history or available BinLogs, re-snapshotting to ensure consistency.`
             );
+            return false;
           }
-          return isAvailable;
         } finally {
           connection.release();
         }
@@ -267,9 +278,10 @@ export class BinLogStream {
       const flushResults = await this.storage.startBatch(
         {
           logger: this.logger,
-          zeroLSN: common.ReplicatedGTID.ZERO.comparable,
+          zeroLSN: common.ReplicatedGTID.ZERO(this.activeServerUuid!).comparable,
           defaultSchema: this.defaultSchema,
-          storeCurrentData: false
+          storeCurrentData: false,
+          signal: this.abortSignal
         },
         async (batch) => {
           for (let tablePattern of sourceTables) {
@@ -296,8 +308,8 @@ export class BinLogStream {
     }
 
     if (lastOp != null) {
-      // Populate the cache _after_ initial replication, but _before_ we switch to this replication stream.
-      await this.storage.populatePersistentChecksumCache({
+      // Compact storage _after_ initial replication, but _before_ we switch to this replication stream.
+      await this.storage.compactInitialReplication({
         // No checkpoint yet, but we do have the opId.
         maxOpId: lastOp,
         signal: this.abortSignal
@@ -363,7 +375,19 @@ export class BinLogStream {
     }
   }
 
+  private async ensureActiveServerUuid() {
+    if (this.activeServerUuid == null) {
+      const connection = await this.connections.getConnection();
+      try {
+        this.activeServerUuid = await common.readServerUuid(connection);
+      } finally {
+        connection.release();
+      }
+    }
+  }
+
   async initReplication() {
+    await this.ensureActiveServerUuid();
     const connection = await this.connections.getConnection();
     const errors = await common.checkSourceConfiguration(connection);
     connection.release();
@@ -382,9 +406,10 @@ export class BinLogStream {
       await this.storage.startBatch(
         {
           logger: this.logger,
-          zeroLSN: common.ReplicatedGTID.ZERO.comparable,
+          zeroLSN: common.ReplicatedGTID.ZERO(this.activeServerUuid!).comparable,
           defaultSchema: this.defaultSchema,
-          storeCurrentData: false
+          storeCurrentData: false,
+          signal: this.abortSignal
         },
         async (batch) => {
           for (let tablePattern of sourceTables) {
@@ -406,21 +431,31 @@ export class BinLogStream {
   }
 
   async streamChanges() {
-    const serverId = createRandomServerId(this.storage.group_id);
+    await this.ensureActiveServerUuid();
+    const serverId = createRandomServerId(this.storage.replicationStreamId);
 
     const connection = await this.connections.getConnection();
-    const { checkpoint_lsn } = await this.storage.getStatus();
-    if (checkpoint_lsn) {
-      this.logger.info(`Existing checkpoint found: ${checkpoint_lsn}`);
+    let fromGTID: common.ReplicatedGTID;
+    try {
+      const { resumeLsn: resume_lsn } = await this.storage.getStatus();
+      if (resume_lsn) {
+        this.logger.info(`Existing resume LSN found: ${resume_lsn}`);
+      }
+      fromGTID = resume_lsn
+        ? common.ReplicatedGTID.fromSerialized(resume_lsn)
+        : await common.readExecutedGtid(connection);
+    } finally {
+      connection.release();
     }
-    const fromGTID = checkpoint_lsn
-      ? common.ReplicatedGTID.fromSerialized(checkpoint_lsn)
-      : await common.readExecutedGtid(connection);
-    connection.release();
 
     if (!this.stopped) {
       await this.storage.startBatch(
-        { zeroLSN: common.ReplicatedGTID.ZERO.comparable, defaultSchema: this.defaultSchema, storeCurrentData: false },
+        {
+          zeroLSN: common.ReplicatedGTID.ZERO(this.activeServerUuid!).comparable,
+          defaultSchema: this.defaultSchema,
+          storeCurrentData: false,
+          signal: this.abortSignal
+        },
         async (batch) => {
           const binlogEventHandler = this.createBinlogEventHandler(batch);
           const binlogListener = new BinLogListener({
@@ -429,8 +464,10 @@ export class BinLogStream {
             startGTID: fromGTID,
             connectionManager: this.connections,
             serverId: serverId,
+            activeServerUuid: this.activeServerUuid!,
             eventHandler: binlogEventHandler
           });
+          this.binLogListener = binlogListener;
 
           this.abortSignal.addEventListener(
             'abort',
@@ -664,6 +701,14 @@ export class BinLogStream {
 
   getReplicationLagMillis(): number | undefined {
     return this.replicationLag.getLagMillis();
+  }
+
+  /**
+   * Probe the liveness of the BinLog Listener's control connection. Called from the replication
+   * job's keepAlive. Does nothing before streaming starts (during the initial snapshot).
+   */
+  probeControlConnection(): void {
+    this.binLogListener?.probeControlConnection();
   }
 
   async tryRollback(promiseConnection: mysqlPromise.Connection) {

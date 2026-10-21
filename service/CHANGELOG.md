@@ -1,5 +1,248 @@
 # @powersync/service-image
 
+## 1.27.1
+
+### Patch Changes
+
+- 0c995fe: Update CA bundles
+- 0c995fe: Node v24.22.0
+- 286b0f8: Update WebSocket and HTTP dependencies to address reported security vulnerabilities. Update the OpenTelemetry metrics exporters to remove the protobufjs dependency and include metrics security fixes.
+- 286b0f8: Update Node.js to 24.21.0.
+- Updated dependencies [f6ba406]
+- Updated dependencies [44ce423]
+- Updated dependencies [51a1a89]
+- Updated dependencies [fff5024]
+- Updated dependencies [4df5d45]
+- Updated dependencies [286b0f8]
+- Updated dependencies [1decb46]
+- Updated dependencies [57ef2f4]
+  - @powersync/service-module-mongodb@0.22.0
+  - @powersync/service-core@1.27.1
+  - @powersync/service-module-postgres@0.23.3
+  - @powersync/service-module-mysql@0.16.4
+  - @powersync/service-module-mssql@0.10.4
+  - @powersync/service-module-convex@0.4.3
+  - @powersync/service-module-mongodb-storage@0.23.1
+  - @powersync/service-module-postgres-storage@0.19.3
+  - @powersync/lib-services-framework@0.10.4
+  - @powersync/service-module-core@0.2.37
+  - @powersync/service-rsocket-router@0.2.29
+
+## 1.27.0
+
+### Patch Changes
+
+- Updated dependencies [0483d4e]
+- Updated dependencies [28f024b]
+- Updated dependencies [5078032]
+- Updated dependencies [155febf]
+- Updated dependencies [54d6f4b]
+- Updated dependencies [18380b6]
+- Updated dependencies [424bbc0]
+- Updated dependencies [b70f467]
+- Updated dependencies [18f0c95]
+- Updated dependencies [c60db6e]
+- Updated dependencies [ae69813]
+- Updated dependencies [a8c3f15]
+  - @powersync/service-core@1.27.0
+  - @powersync/service-module-mongodb-storage@0.23.0
+  - @powersync/service-module-postgres-storage@0.19.2
+  - @powersync/service-module-mongodb@0.21.2
+  - @powersync/service-module-mysql@0.16.3
+  - @powersync/service-module-postgres@0.23.2
+  - @powersync/service-module-convex@0.4.2
+  - @powersync/service-module-core@0.2.36
+  - @powersync/service-module-mssql@0.10.3
+  - @powersync/lib-services-framework@0.10.3
+  - @powersync/service-rsocket-router@0.2.28
+
+## 1.26.1
+
+### Patch Changes
+
+- Updated dependencies [f842b4e]
+- Updated dependencies [2412d7a]
+- Updated dependencies [7cce8bd]
+- Updated dependencies [dfabd21]
+- Updated dependencies [8b711ea]
+  - @powersync/service-module-mongodb-storage@0.22.0
+  - @powersync/service-core@1.26.1
+  - @powersync/service-module-mongodb@0.21.1
+  - @powersync/service-module-convex@0.4.1
+  - @powersync/service-module-mssql@0.10.2
+  - @powersync/service-module-mysql@0.16.2
+  - @powersync/service-module-postgres@0.23.1
+  - @powersync/service-module-core@0.2.35
+  - @powersync/service-module-postgres-storage@0.19.1
+  - @powersync/lib-services-framework@0.10.2
+  - @powersync/service-rsocket-router@0.2.27
+
+## 1.26.0
+
+### Patch Changes
+
+- Updated dependencies [e11c54b]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [0077a8d]
+- Updated dependencies [332d649]
+- Updated dependencies [33a3c23]
+- Updated dependencies [fccdff2]
+- Updated dependencies [989d9e1]
+- Updated dependencies [646c0de]
+- Updated dependencies [d89195c]
+- Updated dependencies [aecf844]
+- Updated dependencies [cc121b3]
+- Updated dependencies [4e4063b]
+- Updated dependencies [2407f71]
+- Updated dependencies [10131ca]
+- Updated dependencies [2725f87]
+- Updated dependencies [4037e8f]
+- Updated dependencies [dd7a22f]
+- Updated dependencies [a997c88]
+  - @powersync/service-module-mongodb-storage@0.21.0
+  - @powersync/service-core@1.26.0
+  - @powersync/service-module-postgres-storage@0.19.0
+  - @powersync/service-module-postgres@0.23.0
+  - @powersync/service-module-mongodb@0.21.0
+  - @powersync/service-module-convex@0.4.0
+  - @powersync/service-module-mysql@0.16.1
+  - @powersync/service-module-mssql@0.10.1
+  - @powersync/service-module-core@0.2.34
+  - @powersync/lib-services-framework@0.10.1
+  - @powersync/service-rsocket-router@0.2.26
+
+## 1.25.0
+
+### Patch Changes
+
+- Updated dependencies [3ca835d]
+- Updated dependencies [798d739]
+- Updated dependencies [798d739]
+- Updated dependencies [41dcd7a]
+- Updated dependencies [9d0b129]
+- Updated dependencies [798d739]
+- Updated dependencies [27b56cb]
+- Updated dependencies [798d739]
+  - @powersync/service-module-mssql@0.10.0
+  - @powersync/service-module-mysql@0.16.0
+  - @powersync/service-module-postgres-storage@0.18.0
+  - @powersync/service-core@1.25.0
+  - @powersync/service-module-mongodb-storage@0.20.0
+  - @powersync/service-module-convex@0.3.1
+  - @powersync/service-module-mongodb@0.20.1
+  - @powersync/service-module-postgres@0.22.1
+  - @powersync/service-module-core@0.2.33
+
+## 1.24.0
+
+### Patch Changes
+
+- 123c801: Reconnect PostgreSQL notification connections and restore `LISTEN` subscriptions when the underlying connection is terminated. Harden connection-slot retries and lease handling, and publish checkpoint notifications atomically with checkpoint updates.
+- 6470100: Node v24.18.1. When using `unstable_sqlite_expression_engine`, this may change how floating-point values are converted to text, due to the bundled SQLite version being upgraded to 3.53.
+- Updated dependencies [087b61e]
+- Updated dependencies [294f334]
+- Updated dependencies [0a511c2]
+- Updated dependencies [2189250]
+- Updated dependencies [922f974]
+- Updated dependencies [c4860c9]
+- Updated dependencies [37591e9]
+- Updated dependencies [483415d]
+- Updated dependencies [63707af]
+- Updated dependencies [be14bfe]
+- Updated dependencies [aab068b]
+- Updated dependencies [123c801]
+- Updated dependencies [b3cbc25]
+- Updated dependencies [37591e9]
+- Updated dependencies [df5663b]
+- Updated dependencies [be42e25]
+- Updated dependencies [be42e25]
+  - @powersync/service-module-postgres@0.22.0
+  - @powersync/service-module-mongodb@0.20.0
+  - @powersync/service-core@1.24.0
+  - @powersync/service-module-mssql@0.9.0
+  - @powersync/service-module-postgres-storage@0.17.0
+  - @powersync/lib-services-framework@0.10.0
+  - @powersync/service-module-convex@0.3.0
+  - @powersync/service-module-mongodb-storage@0.19.0
+  - @powersync/service-module-mysql@0.15.0
+  - @powersync/service-rsocket-router@0.2.25
+  - @powersync/service-module-core@0.2.32
+
+## 1.23.3
+
+### Patch Changes
+
+- Updated dependencies [d99c31f]
+- Updated dependencies [ea31f64]
+- Updated dependencies [1f854d3]
+  - @powersync/service-module-mongodb@0.19.0
+  - @powersync/service-module-mongodb-storage@0.18.3
+  - @powersync/service-core@1.23.3
+  - @powersync/lib-services-framework@0.9.8
+  - @powersync/service-module-convex@0.2.3
+  - @powersync/service-module-mssql@0.8.3
+  - @powersync/service-module-mysql@0.14.3
+  - @powersync/service-module-postgres@0.21.3
+  - @powersync/service-module-postgres-storage@0.16.3
+  - @powersync/service-module-core@0.2.31
+  - @powersync/service-rsocket-router@0.2.24
+
+## 1.23.2
+
+### Patch Changes
+
+- Updated dependencies [71d4a0a]
+- Updated dependencies [e4f683d]
+- Updated dependencies [71d4a0a]
+- Updated dependencies [c2edf86]
+- Updated dependencies [df9ab1e]
+- Updated dependencies [b9f6b6f]
+  - @powersync/service-core@1.23.2
+  - @powersync/service-module-postgres-storage@0.16.2
+  - @powersync/service-module-mongodb-storage@0.18.2
+  - @powersync/service-module-postgres@0.21.2
+  - @powersync/service-module-mongodb@0.18.2
+  - @powersync/service-module-convex@0.2.2
+  - @powersync/service-module-mssql@0.8.2
+  - @powersync/service-module-mysql@0.14.2
+  - @powersync/service-module-core@0.2.30
+  - @powersync/lib-services-framework@0.9.7
+  - @powersync/service-rsocket-router@0.2.23
+
+## 1.23.1
+
+### Patch Changes
+
+- Updated dependencies [7e65360]
+  - @powersync/service-module-postgres-storage@0.16.1
+  - @powersync/service-module-mongodb-storage@0.18.1
+  - @powersync/service-core@1.23.1
+  - @powersync/service-module-convex@0.2.1
+  - @powersync/service-module-mongodb@0.18.1
+  - @powersync/service-module-mssql@0.8.1
+  - @powersync/service-module-mysql@0.14.1
+  - @powersync/service-module-postgres@0.21.1
+  - @powersync/service-module-core@0.2.29
+
+## 1.23.0
+
+### Patch Changes
+
+- Updated dependencies [a91a08f]
+- Updated dependencies [101ea67]
+  - @powersync/service-module-postgres-storage@0.16.0
+  - @powersync/service-module-mongodb-storage@0.18.0
+  - @powersync/service-module-postgres@0.21.0
+  - @powersync/service-module-mongodb@0.18.0
+  - @powersync/service-module-convex@0.2.0
+  - @powersync/service-core@1.23.0
+  - @powersync/service-module-mssql@0.8.0
+  - @powersync/service-module-mysql@0.14.0
+  - @powersync/service-module-core@0.2.28
+  - @powersync/lib-services-framework@0.9.6
+  - @powersync/service-rsocket-router@0.2.22
+
 ## 1.22.0
 
 ### Minor Changes

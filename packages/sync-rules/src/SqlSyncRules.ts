@@ -1,18 +1,32 @@
 import { BucketPriority } from './BucketDescription.js';
-import { BucketParameterQuerier, QuerierError } from './BucketParameterQuerier.js';
 import { SyncConfig, SyncConfigWithErrors } from './SyncConfig.js';
 import { SyncRulesErrors, YamlError } from './errors.js';
 import { SyncConfigFromYaml } from './from_yaml.js';
 import { RequestParameters, SourceSchema, SqliteJsonRow } from './types.js';
 
+/**
+ * Source connection types keyed by connection tag for sync config validation.
+ */
+export type SourceConnectionMap = Record<string, { type: string }>;
+
 export interface SyncRulesOptions {
+  /**
+   * Source database schema.
+   */
   schema?: SourceSchema;
+
   /**
    * The default schema to use when only a table name is specified.
    *
    * 'public' for Postgres, default database for MongoDB/MySQL.
    */
   defaultSchema: string;
+
+  /**
+   * Source connection types keyed by connection tag. When omitted, source-specific options report warnings
+   * if their connection type cannot be checked.
+   */
+  connections?: SourceConnectionMap;
 
   throwOnError?: boolean;
 }
@@ -58,11 +72,6 @@ export interface GetQuerierOptions {
   streams: Record<string, RequestedStream[]>;
 }
 
-export interface GetBucketParameterQuerierResult {
-  querier: BucketParameterQuerier;
-  errors: QuerierError[];
-}
-
 export class SqlSyncRules extends SyncConfig {
   static validate(yaml: string, options: SyncRulesOptions): YamlError[] {
     try {
@@ -84,7 +93,8 @@ export class SqlSyncRules extends SyncConfig {
       {
         throwOnError: options.throwOnError ?? true,
         schema: options.schema,
-        defaultSchema: options.defaultSchema
+        defaultSchema: options.defaultSchema,
+        connections: options.connections
       },
       yaml
     );

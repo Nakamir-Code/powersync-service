@@ -13,14 +13,20 @@ import {
   unsettledPromise,
   updateSyncRulesFromYaml
 } from '@powersync/service-core';
-import { bucketRequest, METRICS_HELPER, StorageDataHelpers, test_utils } from '@powersync/service-core-tests';
+import {
+  bucketRequest,
+  getTestStorage,
+  METRICS_HELPER,
+  StorageDataHelpers,
+  test_utils
+} from '@powersync/service-core-tests';
 import * as pgwire from '@powersync/service-jpgwire';
 import { clearTestDb, getClientCheckpoint, TEST_CONNECTION_OPTIONS } from './util.js';
 
 export class WalStreamTestContext implements AsyncDisposable {
   private _walStream?: WalStream;
   private abortController = new AbortController();
-  private syncRulesContent?: storage.PersistedSyncRulesContent;
+  private syncRulesContent?: storage.PersistedSyncConfigContent;
   public storage?: SyncRulesBucketStorage;
   private settledReplicationPromise?: Promise<PromiseSettledResult<void>>;
 
@@ -89,37 +95,37 @@ export class WalStreamTestContext implements AsyncDisposable {
   }
 
   async updateSyncRules(content: string) {
-    const syncRules = await this.factory.updateSyncRules(
+    const replicationStream = await this.factory.updateSyncRules(
       updateSyncRulesFromYaml(content, { validate: true, storageVersion: this.storageVersion })
     );
-    this.syncRulesContent = syncRules;
-    this.storage = this.factory.getInstance(syncRules);
+    this.syncRulesContent = replicationStream.syncConfigContent[0];
+    this.storage = await getTestStorage(this.factory, replicationStream);
     return this.storage!;
   }
 
   async loadNextSyncRules() {
-    const syncRules = await this.factory.getNextSyncRulesContent();
-    if (syncRules == null) {
+    const syncConfig = await this.factory.getDeployingSyncConfig();
+    if (syncConfig == null) {
       throw new Error(`Next replication stream not available`);
     }
 
-    this.syncRulesContent = syncRules;
-    this.storage = this.factory.getInstance(syncRules);
+    this.syncRulesContent = syncConfig.content;
+    this.storage = await getTestStorage(this.factory, syncConfig.replicationStream);
     return this.storage!;
   }
 
   async loadActiveSyncRules() {
-    const syncRules = await this.factory.getActiveSyncRulesContent();
-    if (syncRules == null) {
+    const syncConfig = await this.factory.getActiveSyncConfig();
+    if (syncConfig == null) {
       throw new Error(`Active replication stream not available`);
     }
 
-    this.syncRulesContent = syncRules;
-    this.storage = this.factory.getInstance(syncRules);
+    this.syncRulesContent = syncConfig.content;
+    this.storage = await getTestStorage(this.factory, syncConfig.replicationStream);
     return this.storage!;
   }
 
-  private getSyncRulesContent(): storage.PersistedSyncRulesContent {
+  private getSyncConfigContent(): storage.PersistedSyncConfigContent {
     if (this.syncRulesContent == null) {
       throw new Error('Sync config not configured - call updateSyncRules() first');
     }
@@ -186,7 +192,7 @@ export class WalStreamTestContext implements AsyncDisposable {
   }
 
   async getBucketsDataBatch(buckets: Record<string, InternalOpId>, options?: { timeout?: number }) {
-    const helpers = new StorageDataHelpers(this.storage!, this.getSyncRulesContent());
+    const helpers = new StorageDataHelpers(this.storage!, this.getSyncConfigContent());
     const checkpoint = await this.getCheckpoint(options);
     return helpers.getBucketsDataBatch(buckets, checkpoint);
   }
@@ -195,15 +201,15 @@ export class WalStreamTestContext implements AsyncDisposable {
    * This waits for a client checkpoint.
    */
   async getBucketData(bucket: string, start?: InternalOpId | string | undefined, options?: { timeout?: number }) {
-    const helpers = new StorageDataHelpers(this.storage!, this.getSyncRulesContent());
+    const helpers = new StorageDataHelpers(this.storage!, this.getSyncConfigContent());
     const checkpoint = await this.getCheckpoint(options);
     return helpers.getBucketData(bucket, checkpoint, start);
   }
 
   async getChecksums(buckets: string[], options?: { timeout?: number }) {
     const checkpoint = await this.getCheckpoint(options);
-    const syncRules = this.getSyncRulesContent();
-    const versionedBuckets = buckets.map((bucket) => bucketRequest(syncRules, bucket, 0n));
+    const syncConfigContent = this.getSyncConfigContent();
+    const versionedBuckets = buckets.map((bucket) => bucketRequest(syncConfigContent, bucket, 0n));
     const checksums = await this.storage!.getChecksums(checkpoint, versionedBuckets);
 
     const unversioned = new Map();
@@ -227,11 +233,11 @@ export class WalStreamTestContext implements AsyncDisposable {
     if (typeof start == 'string') {
       start = BigInt(start);
     }
-    const syncRules = this.getSyncRulesContent();
-    const { checkpoint } = await this.storage!.getCheckpoint();
-    const map = [bucketRequest(syncRules, bucket, start)];
+    const syncConfigContent = this.getSyncConfigContent();
+    const checkpoint = await this.storage!.getCheckpoint();
+    const map = [bucketRequest(syncConfigContent, bucket, start)];
     const batch = this.storage!.getBucketDataBatch(checkpoint, map);
-    const batches = await test_utils.fromAsync(batch);
+    const batches = await test_utils.getBatchArray(batch);
     return batches[0]?.chunkData.data ?? [];
   }
 
@@ -264,19 +270,13 @@ export async function withMaxWalSize(db: pgwire.PgClient, size: string) {
   try {
     const r1 = await db.query(`SHOW max_slot_wal_keep_size`);
 
-    await db.query(`ALTER SYSTEM SET max_slot_wal_keep_size = '${size}'`);
-    await db.query(`SELECT pg_reload_conf()`);
-    // Wait for the config reload to propagate to all backends
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await setMaxWalSize(db, size);
 
-    const oldSize = r1.results[0].rows[0].decodeWithoutCustomTypes(0);
+    const oldSize = String(r1.results[0].rows[0].decodeWithoutCustomTypes(0));
 
     return {
       [Symbol.asyncDispose]: async () => {
-        await db.query(`ALTER SYSTEM SET max_slot_wal_keep_size = '${oldSize}'`);
-        await db.query(`SELECT pg_reload_conf()`);
-        // Wait for the config reload to propagate to all backends
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await setMaxWalSize(db, oldSize);
       }
     };
   } catch (e) {
@@ -284,4 +284,31 @@ export async function withMaxWalSize(db: pgwire.PgClient, size: string) {
     err.cause = e;
     throw err;
   }
+}
+
+async function setMaxWalSize(db: pgwire.PgClient, size: string) {
+  const start = Date.now();
+
+  await db.query(`ALTER SYSTEM SET max_slot_wal_keep_size = '${size}'`);
+  await db.query(`SELECT pg_reload_conf()`);
+
+  // pg_reload_conf() returns before the new value is applied
+  const timeout = 5_000;
+
+  while (Date.now() - start < timeout) {
+    const [row] = pgwire.pgwireRows(
+      await db.query({
+        statement: `SELECT pg_size_bytes(current_setting('max_slot_wal_keep_size'))::text AS current, pg_size_bytes($1)::text AS expected`,
+        params: [{ type: 'varchar', value: size }]
+      })
+    );
+
+    if (row.current == row.expected) {
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  throw new Error('Timeout while waiting for max_slot_wal_keep_size');
 }

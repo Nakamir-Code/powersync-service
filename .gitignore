@@ -4,6 +4,7 @@
 .swc
 
 node_modules
+.pnpm-store
 dist
 
 .env
@@ -17,9 +18,12 @@ npm-error.log
 .local-dev
 .probes
 powersync.yaml
-sync-rules.yaml
+sync-config.yaml
 
 
 packages/*/manifest.json
 
 .clinic
+
+# Local implementation plans
+/plans/

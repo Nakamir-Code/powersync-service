@@ -1,4 +1,4 @@
-import { isMongoNetworkTimeoutError, isMongoServerError, mongo } from '@powersync/lib-service-mongodb';
+import { isMaxTimeMSExpiredError, isMongoServerError, isTimeoutError, mongo } from '@powersync/lib-service-mongodb';
 import {
   DatabaseConnectionError,
   ErrorCode,
@@ -13,8 +13,11 @@ export interface RawChangeStreamOptions {
 
   /**
    * How long to wait for new data per batch (max time for long-polling).
+   * This is sent as maxTimeMS for the getMore command.
    *
-   * This is used for maxTimeMS for the getMore command.
+   * A value of 0 removes the explicit await limit and leaves the server's
+   * default awaitData behavior in effect; it does not make getMore return
+   * immediately. Snapshot probes use 0 for this purpose.
    */
   maxAwaitTimeMS: number;
 
@@ -212,31 +215,27 @@ async function* rawChangeStreamInner(
       options.signal?.throwIfAborted();
 
       using commandSpan = options.tracer?.span('changestream', 'getmore');
-      const getMoreResult: mongo.Document = await db
-        .command(
-          {
-            getMore: cursorId,
-            collection: nsCollection,
-            batchSize: batchSizer.next(),
-            maxTimeMS: options.maxAwaitTimeMS
-          },
-          { session, raw: true }
-        )
-        .catch((e) => {
-          if (isMongoServerError(e) && e.codeName == 'CursorKilled') {
-            // This may be due to the killCursors command issued when aborting.
-            // In that case, use the abort error instead.
-            options.signal?.throwIfAborted();
-          }
+      const getMoreCommand: mongo.Document = {
+        getMore: cursorId,
+        collection: nsCollection,
+        batchSize: batchSizer.next(),
+        maxTimeMS: options.maxAwaitTimeMS
+      };
+      const getMoreResult: mongo.Document = await db.command(getMoreCommand, { session, raw: true }).catch((e) => {
+        if (isMongoServerError(e) && e.codeName == 'CursorKilled') {
+          // This may be due to the killCursors command issued when aborting.
+          // In that case, use the abort error instead.
+          options.signal?.throwIfAborted();
+        }
 
-          if (isResumableChangeStreamError(e)) {
-            if (isTimeoutError(e)) {
-              batchSizer.reduceAfterError();
-            }
-            throw new ResumableChangeStreamError(e.message, { cause: e });
+        if (isResumableChangeStreamError(e)) {
+          if (isTimeoutError(e)) {
+            batchSizer.reduceAfterError();
           }
-          throw mapChangeStreamError(e);
-        });
+          throw new ResumableChangeStreamError(e.message, { cause: e });
+        }
+        throw mapChangeStreamError(e);
+      });
 
       commandSpan?.end();
 
@@ -365,7 +364,7 @@ type MapRawDocument<T> = T extends unknown ? { [K in keyof T]: Rawify<T[K]> } : 
 export type ProjectedChangeStreamDocument =
   | Omit<mongo.ChangeStreamDropDocument, 'wallTime' | 'collectionUUID'>
   | Omit<mongo.ChangeStreamRenameDocument, 'wallTime'>
-  | Omit<mongo.ChangeStreamDeleteDocument<Buffer>, 'wallTime'>
+  | Omit<mongo.ChangeStreamDeleteDocument<Buffer>, 'wallTime' | 'collectionUUID'>
   | Omit<mongo.ChangeStreamInsertDocument<Buffer>, 'wallTime'>
   | Omit<mongo.ChangeStreamUpdateDocument<Buffer>, 'wallTime' | 'updateDescription'>
   | Omit<mongo.ChangeStreamReplaceDocument<Buffer>, 'wallTime'>;
@@ -400,10 +399,6 @@ export function parseChangeDocument(buffer: Buffer): ProjectedChangeStreamDocume
   return doc as any;
 }
 
-function isTimeoutError(e: unknown) {
-  return isMongoNetworkTimeoutError(e) || (isMongoServerError(e) && e.codeName == 'MaxTimeMSExpired');
-}
-
 function isResumableChangeStreamError(e: unknown) {
   // See: https://github.com/mongodb/specifications/blob/master/source/change-streams/change-streams.md#resumable-error
   if (!isMongoServerError(e)) {
@@ -415,8 +410,8 @@ function isResumableChangeStreamError(e: unknown) {
   } else if (e.hasErrorLabel('ResumableChangeStreamError')) {
     // For servers with wire version 9 or higher (server version 4.4 or higher), any server error with the ResumableChangeStreamError error label.
     return true;
-  } else if (e.codeName == 'MaxTimeMSExpired') {
-    // Our own exception for MaxTimeMSExpired.
+  } else if (isMaxTimeMSExpiredError(e)) {
+    // Our own exception for maxTimeMS timeouts.
     // This can help us retry faster, with a smaller batch size (if initialBatchSize is set to 1), which should hopefully avoid the timeout.
     return true;
   } else {
@@ -437,7 +432,7 @@ export function mapChangeStreamError(e: unknown) {
   } else if (
     isMongoServerError(e) &&
     e.codeName == 'NoMatchingDocument' &&
-    e.errmsg?.includes('post-image was not found')
+    (e.errmsg?.includes('post-image was not found') || e.errmsg?.includes('pre-image was not found'))
   ) {
     throw new ChangeStreamInvalidatedError(e.errmsg, e);
   } else if (isMongoServerError(e) && e.hasErrorLabel('NonResumableChangeStreamError')) {

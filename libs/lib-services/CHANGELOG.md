@@ -1,5 +1,114 @@
 # @powersync/lib-services-framework
 
+## 0.10.4
+
+### Patch Changes
+
+- 44ce423: Add `config.source_table_options` to edition 3 sync configs, including MongoDB pre-filtering expressions. Generate editor schemas with examples and report validation errors at their YAML source locations.
+
+  MongoDB replication pre-filtering is not supported in the Open Edition; unsupported configurations report `PSYNC_S1348`. For example:
+
+  ```yaml
+  config:
+    edition: 3
+    source_table_options:
+      orders:
+        mongodb_filter_expression:
+          $and:
+            - $eq: ['$$doc.active', true]
+            - $in: ['$$doc.status', ['pending', 'shipped']]
+  streams:
+    orders:
+      query: SELECT * FROM orders
+  ```
+
+  Validation and deployment reject filters when the feature is unavailable. Parsing accepts an optional map of connection tags to connection types, rejecting MongoDB pre-filtering expressions on known non-MongoDB sources. Unknown connections or missing connection metadata produce advisory warnings. The service supplies connection metadata during validation, deployment, and filesystem loading. Filesystem-loaded sync configs also run source-capability checks. With `exit_on_error` disabled, configs remain available to diagnostics. Changing source-table options requires replacement processing when deploying a new sync config.
+
+  Source capability validation returns structured `ValidationDiagnostic` entries, allowing multiple fatal issues and
+  advisory warnings. Deployment and reprocessing reject fatal diagnostics while validation continues collecting
+  independent findings. Existing `ReplicationError` consumers retain the same diagnostic shape.
+
+- Updated dependencies [44ce423]
+- Updated dependencies [e703ca5]
+- Updated dependencies [fff5024]
+- Updated dependencies [324093e]
+- Updated dependencies [57ef2f4]
+- Updated dependencies [6700c71]
+  - @powersync/service-sync-rules@0.44.0
+  - @powersync/service-errors@0.6.0
+
+## 0.10.3
+
+### Patch Changes
+
+- Updated dependencies [5078032]
+- Updated dependencies [e87703a]
+- Updated dependencies [18f0c95]
+- Updated dependencies [c60db6e]
+- Updated dependencies [0483d4e]
+  - @powersync/service-sync-rules@0.43.0
+
+## 0.10.2
+
+### Patch Changes
+
+- Updated dependencies [5ae6f75]
+  - @powersync/service-sync-rules@0.42.0
+
+## 0.10.1
+
+### Patch Changes
+
+- Updated dependencies [4b6a23e]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [646c0de]
+- Updated dependencies [3972bac]
+  - @powersync/service-sync-rules@0.41.0
+
+## 0.10.0
+
+### Minor Changes
+
+- 2189250: Add `/sync/checkpoint-request` for client-supplied checkpoint request ids, previously called write checkpoint ids. The route returns the stored `checkpoint_request_id`, storage now treats managed request ids as monotonic per user/client, custom checkpoint request ids continue to use the existing `checkpoint` field for backwards compatibility, and `checkpoint_requested_at` metadata lets compact jobs remove expired request-derived checkpoint records.
+
+  This release includes storage migrations for the checkpoint request metadata. Self-hosters should run migrations as part of the upgrade.
+
+### Patch Changes
+
+- Updated dependencies [8daa300]
+- Updated dependencies [be42e25]
+- Updated dependencies [be42e25]
+- Updated dependencies [cb4c627]
+  - @powersync/service-sync-rules@0.40.0
+  - @powersync/service-errors@0.5.0
+
+## 0.9.8
+
+### Patch Changes
+
+- Updated dependencies [ea71bf3]
+- Updated dependencies [edc6ed4]
+  - @powersync/service-sync-rules@0.39.0
+
+## 0.9.7
+
+### Patch Changes
+
+- Updated dependencies [a6ae678]
+  - @powersync/service-sync-rules@0.38.1
+
+## 0.9.6
+
+### Patch Changes
+
+- Updated dependencies [a91a08f]
+- Updated dependencies [184c39f]
+- Updated dependencies [c3f75df]
+- Updated dependencies [4bd35ea]
+  - @powersync/service-errors@0.4.4
+  - @powersync/service-sync-rules@0.38.0
+
 ## 0.9.5
 
 ### Patch Changes

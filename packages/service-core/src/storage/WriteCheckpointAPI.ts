@@ -1,3 +1,5 @@
+import { EventDefinitionId } from '@powersync/service-sync-rules';
+
 export enum WriteCheckpointMode {
   /**
    * Raw mappings of `user_id` to `write_checkpoint`s should
@@ -19,7 +21,21 @@ export interface BaseWriteCheckpointIdentifier {
   user_id: string;
 }
 
-export interface CustomWriteCheckpointFilters extends BaseWriteCheckpointIdentifier {
+export interface ClientRequestedCheckpointOptions {
+  /**
+   * Supplied for client-generated checkpoint requests.
+   *
+   * If omitted, storage creates or stores a regular write checkpoint.
+   * If supplied for managed write checkpoints, storage only uses it when it is
+   * greater than the stored id for the user_id. Same or lower supplied ids are
+   * no-ops, and storage returns the current stored id.
+   */
+  checkpoint_request_id?: bigint;
+}
+
+export type SyncStorageCustomWriteCheckpointFilters = BaseWriteCheckpointIdentifier;
+
+export interface CustomWriteCheckpointFilters extends SyncStorageCustomWriteCheckpointFilters {
   /**
    * Replication stream which was active when this checkpoint was created.
    */
@@ -28,9 +44,25 @@ export interface CustomWriteCheckpointFilters extends BaseWriteCheckpointIdentif
 
 export interface BatchedCustomWriteCheckpointOptions extends BaseWriteCheckpointIdentifier {
   /**
-   * A supplied incrementing Write Checkpoint number
+   * A supplied incrementing checkpoint request id. This is still named
+   * "write checkpoint" in storage APIs for backwards compatibility.
    */
   checkpoint: bigint;
+  /**
+   * Compiled event definition which created the checkpoint.
+   *
+   * Incremental replication uses this to keep checkpoint records produced by
+   * active and processing sync configs separate. This is required by v3
+   * storage and unused by legacy storage versions.
+   */
+  event_id?: EventDefinitionId;
+  /**
+   * Required when this custom checkpoint was created from a client checkpoint
+   * request and should be eligible for checkpoint request retention cleanup.
+   * Omit or set to null for persistent custom checkpoints owned by the source
+   * or integration.
+   */
+  checkpoint_requested_at?: Date | null;
 }
 
 export interface CustomWriteCheckpointOptions extends BatchedCustomWriteCheckpointOptions {
@@ -50,15 +82,117 @@ export interface ManagedWriteCheckpointFilters extends BaseWriteCheckpointIdenti
   heads: Record<string, string>;
 }
 
-export type ManagedWriteCheckpointOptions = ManagedWriteCheckpointFilters;
+export type ManagedWriteCheckpointOptions = ManagedWriteCheckpointFilters & ClientRequestedCheckpointOptions;
 
-export type SyncStorageLastWriteCheckpointFilters = BaseWriteCheckpointIdentifier | ManagedWriteCheckpointFilters;
+export interface CreateManagedWriteCheckpointsResult {
+  /**
+   * Current managed checkpoint id for each full user_id after applying the batch.
+   */
+  writeCheckpoints: Map<string, bigint>;
+  /**
+   * True when the source marker must be forced so replication observes the
+   * stored head. Callers use this to advance the source marker once for the
+   * whole batch.
+   *
+   * This must be true whenever a checkpoint in the batch has not yet been
+   * processed by replication - both freshly created/advanced checkpoints and
+   * existing checkpoints matched by a stale or duplicate request that are still
+   * pending. Already-processed checkpoints do not need a new marker.
+   *
+   * The case this guards against is a lost source marker on a stale retry. The
+   * source marker is forced after the checkpoint is persisted, so the two are
+   * not atomic (storage and source are usually different databases). Without
+   * this flag, the following sequence strands the checkpoint:
+   *
+   *   1. A client-supplied checkpoint id is persisted (write checkpoint stored,
+   *      processed_at_lsn null).
+   *   2. Forcing the source marker fails, so the request errors and the client
+   *      retries with the same id.
+   *   3. The retry is a no-op for the stored id (monotonic, not greater), so if
+   *      we only advanced on "a row changed" we would skip the marker.
+   *   4. On an idle source nothing else moves replication past the stored head,
+   *      so the checkpoint never gets acknowledged and the client waits forever.
+   *
+   * Reporting true while the checkpoint is still pending makes the retry re-force
+   * the marker, which resolves the wait.
+   *
+   * Backends that do not track a per-row processed indicator may conservatively
+   * report true whenever any checkpoint was matched.
+   */
+  shouldAdvance: boolean;
+}
+
+export function uniqueManagedWriteCheckpoints(
+  checkpoints: ManagedWriteCheckpointOptions[]
+): ManagedWriteCheckpointOptions[] {
+  const byUser = new Map<string, ManagedWriteCheckpointOptions>();
+
+  for (const checkpoint of checkpoints) {
+    const existing = byUser.get(checkpoint.user_id);
+    // A batch can contain entries for many users, and different users may use
+    // different request types (generated vs client-supplied). For a single full
+    // user_id, though, all entries should be the same type - a batch can still
+    // hold multiple entries for that user (e.g. coalesced requests), so we
+    // collapse them to one. For client-supplied ids we keep the greatest
+    // requested value, so lower stale ids cannot hide the request that should
+    // advance storage. For generated ids the entries are equivalent, so any one
+    // is kept.
+    //
+    // Mixing generated and supplied entries for the same user_id is not expected;
+    // shouldReplaceManagedWriteCheckpoint still resolves it deterministically
+    // (supplied wins) if that invariant is ever violated.
+    if (existing == null || shouldReplaceManagedWriteCheckpoint(existing, checkpoint)) {
+      byUser.set(checkpoint.user_id, checkpoint);
+    }
+  }
+
+  return [...byUser.values()];
+}
+
+function shouldReplaceManagedWriteCheckpoint(
+  existing: ManagedWriteCheckpointOptions,
+  candidate: ManagedWriteCheckpointOptions
+) {
+  const existingRequestId = existing.checkpoint_request_id;
+  const candidateRequestId = candidate.checkpoint_request_id;
+
+  if (candidateRequestId == null) {
+    return existingRequestId == null;
+  }
+
+  if (existingRequestId == null) {
+    return true;
+  }
+
+  return candidateRequestId > existingRequestId;
+}
+
+export type SyncStorageLastWriteCheckpointFilters =
+  | SyncStorageCustomWriteCheckpointFilters
+  | ManagedWriteCheckpointFilters;
 export type LastWriteCheckpointFilters = CustomWriteCheckpointFilters | ManagedWriteCheckpointFilters;
+
+/** Configures checkpoint ownership and generation for a storage instance. */
+export type WriteCheckpointModeConfig =
+  | {
+      mode: WriteCheckpointMode.CUSTOM;
+      /**
+       * Name of the event whose custom checkpoints are served. Storage resolves this name through the active sync
+       * config's persisted mapping; integrations must not construct or persist event ids themselves. Required by
+       * storage implementations that scope custom checkpoints by event definition.
+       */
+      eventName?: string;
+    }
+  | {
+      mode: WriteCheckpointMode.MANAGED;
+    };
 
 export interface BaseWriteCheckpointAPI {
   readonly writeCheckpointMode: WriteCheckpointMode;
-  setWriteCheckpointMode(mode: WriteCheckpointMode): void;
-  createManagedWriteCheckpoint(checkpoint: ManagedWriteCheckpointOptions): Promise<bigint>;
+  setWriteCheckpointMode(config: WriteCheckpointModeConfig): void;
+  createManagedWriteCheckpoints(
+    checkpoints: ManagedWriteCheckpointOptions[]
+  ): Promise<CreateManagedWriteCheckpointsResult>;
 }
 
 /**

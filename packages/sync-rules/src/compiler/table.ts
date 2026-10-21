@@ -2,9 +2,9 @@ import { PGNode } from 'pgsql-ast-parser';
 import { ImplicitSchemaTablePattern, SourceSchemaTable } from '../index.js';
 import { SqlExpression } from '../sync_plan/expression.js';
 import { MapSourceVisitor, visitExpr } from '../sync_plan/expression_visitor.js';
-import { equalsIgnoringResultSetList } from './compatibility.js';
+import { TableValuedFunctionEquality } from './compatibility.js';
 import { StableHasher } from './equality.js';
-import { ColumnInRow, ExpressionInput, NodeLocations, SyncExpression } from './expression.js';
+import { ColumnInRow, ExpressionInput, NodeLocations, RowMetadata, SyncExpression } from './expression.js';
 import { SingleDependencyExpression } from './filter.js';
 import { PreparedSubquery } from './sqlite.js';
 
@@ -78,7 +78,7 @@ export class PhysicalSourceResultSet extends BaseSourceResultSet {
      * streams.
      *
      * This information must only be used to generate analysis warnings, e.g. for column references that don't exist in
-     * resolved tables. It must not affect how sync streams are compiled, as that is always schema-independent.
+     * resolved tables. It must not affect how Sync Streams are compiled, as that is always schema-independent.
      */
     readonly schemaTablesForWarnings: SourceSchemaTable[]
   ) {
@@ -166,15 +166,15 @@ export class TableValuedResultSet extends BaseSourceResultSet {
     }
   }
 
-  buildBehaviorHashCode(hasher: StableHasher) {
+  buildBehaviorHashCode(tableValued: TableValuedFunctionEquality, hasher: StableHasher): void {
     hasher.addString(this.tableValuedFunctionName);
-    equalsIgnoringResultSetList.hash(hasher, this.parameters);
+    tableValued.listEquality.hash(hasher, this.parameters);
   }
 
-  behavesIdenticalTo(other: TableValuedResultSet) {
+  behavesIdenticalTo(other: TableValuedResultSet, tableValued: TableValuedFunctionEquality): boolean {
     return (
-      other.tableValuedFunctionName == this.tableValuedFunctionName &&
-      equalsIgnoringResultSetList.equals(other.parameters, this.parameters)
+      this.tableValuedFunctionName == other.tableValuedFunctionName &&
+      tableValued.listEquality.equals(this.parameters, other.parameters)
     );
   }
 
@@ -206,6 +206,9 @@ export class CloneTableReferences {
     this.cloneExpressions = new MapSourceVisitor<ExpressionInput, ExpressionInput>((data) => {
       if (data instanceof ColumnInRow) {
         return new ColumnInRow(data.syntacticOrigin, this.getClonedSource(data.resultSet), data.column);
+      }
+      if (data instanceof RowMetadata) {
+        return new RowMetadata(data.syntacticOrigin, this.getClonedSource(data.resultSet), data.kind);
       }
 
       return data;

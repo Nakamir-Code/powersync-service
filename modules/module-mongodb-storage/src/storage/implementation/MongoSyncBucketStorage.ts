@@ -2,6 +2,7 @@ import * as lib_mongo from '@powersync/lib-service-mongodb';
 import { mongo } from '@powersync/lib-service-mongodb';
 import {
   BaseObserver,
+  logger as defaultLogger,
   DO_NOT_LOG,
   Logger,
   ReplicationAbortedError,
@@ -11,13 +12,15 @@ import {
   BroadcastIterable,
   CHECKPOINT_INVALIDATE_ALL,
   CheckpointChanges,
+  CompactInitialReplicationOptions,
+  CompactInitialReplicationResults,
   GetCheckpointChangesOptions,
   InternalOpId,
   mergeAsyncIterables,
-  PopulateChecksumCacheOptions,
-  PopulateChecksumCacheResults,
   ReplicationCheckpoint,
+  ReplicationStreamStorageIds,
   storage,
+  SyncRuleState,
   utils,
   WatchWriteCheckpointOptions
 } from '@powersync/service-core';
@@ -25,33 +28,48 @@ import { HydratedSyncConfig, ParameterLookupRows, ScopedParameterLookup } from '
 import * as bson from 'bson';
 import { LRUCache } from 'lru-cache';
 import * as timers from 'timers/promises';
-import { retryOnMongoMaxTimeMSExpired } from '../../utils/util.js';
+import { DEFAULT_CLEAR_BATCH_THROTTLE_RATE } from '../../types/types.js';
 import { MongoBucketStorage } from '../MongoBucketStorage.js';
-import { MongoSyncBucketStorageContext } from './common/MongoSyncBucketStorageContext.js';
+import {
+  MongoGetCheckpointChangesOptions,
+  MongoSyncBucketStorageCheckpoint
+} from './common/MongoSyncBucketStorageCheckpoint.js';
+import { DEFAULT_INLINE_THRESHOLD_BYTES } from './common/PersistedBatch.js';
 import type { VersionedPowerSyncMongo } from './db.js';
 import { StorageConfig } from './models.js';
 import { MongoBucketBatchOptions } from './MongoBucketBatch.js';
 import { MongoChecksumOptions, MongoChecksums } from './MongoChecksums.js';
 import { MongoCompactOptions, MongoCompactor } from './MongoCompactor.js';
 import { MongoParameterCompactor } from './MongoParameterCompactor.js';
-import { MongoPersistedSyncRulesContentV1 } from './MongoPersistedSyncRulesContent.js';
-import { MongoWriteCheckpointAPI } from './MongoWriteCheckpointAPI.js';
+import { MongoParsedSyncConfigSet } from './MongoParsedSyncConfigSet.js';
+import { MongoPersistedReplicationStream } from './MongoPersistedReplicationStream.js';
+import { MongoSyncRulesLock } from './MongoSyncRulesLock.js';
+import { MongoCheckpointAPIOptions, MongoWriteCheckpointAPI } from './MongoWriteCheckpointAPI.js';
+import { ObjectStorage } from './v3/object-storage/ObjectStorage.js';
 
 export interface MongoSyncBucketStorageOptions {
-  checksumOptions?: Omit<MongoChecksumOptions, 'storageConfig' | 'mapping'>;
+  checksumOptions?: Omit<MongoChecksumOptions, 'storageConfig'>;
+  readPreference?: mongo.ReadPreference;
+  checksumCacheTtlMs?: number;
+  clearBatchThrottleRate?: number;
   storageConfig: StorageConfig;
+  objectStorage?: ObjectStorage;
+  inlineThresholdBytes?: number;
+}
+
+/**
+ * The stream state read for a checkpoint. All fields must come from the same snapshot.
+ */
+export interface MongoCheckpointState {
+  checkpoint: InternalOpId;
+  lsn: string | null;
+  /** See {@link MongoSyncBucketStorageCheckpoint.parameterChangesInvalidBefore}. */
+  parameterChangesInvalidBefore: InternalOpId;
 }
 
 interface InternalCheckpointChanges extends CheckpointChanges {
   updatedWriteCheckpoints: Map<string, bigint>;
   invalidateWriteCheckpoints: boolean;
-}
-
-interface WriterSyncState {
-  lastCheckpointLsn: string | null;
-  resumeFromLsn: string | null;
-  keepaliveOp: InternalOpId | null;
-  syncConfigId?: bson.ObjectId | null;
 }
 
 /**
@@ -70,34 +88,73 @@ export abstract class MongoSyncBucketStorage
   implements storage.SyncRulesBucketStorage
 {
   readonly db: VersionedPowerSyncMongo;
+
   [DO_NOT_LOG] = true;
 
   readonly checksums: MongoChecksums;
 
-  private parsedSyncRulesCache: { parsed: HydratedSyncConfig; options: storage.ParseSyncRulesOptions } | undefined;
+  readonly objectStorage?: ObjectStorage;
+  readonly inlineThresholdBytes: number;
+
+  /**
+   * Canonical parsed sync config sets, keyed by defaultSchema.
+   *
+   * Entries are never evicted: each parse options value maps to exactly one parsed set for
+   * the lifetime of this storage instance, so parsed source objects and mappings always
+   * stay associated.
+   */
+  private readonly parsedSyncConfigSets = new Map<string, MongoParsedSyncConfigSet>();
   private writeCheckpointAPI: MongoWriteCheckpointAPI;
   public readonly logger: Logger;
   public readonly storageConfig: StorageConfig;
+  public readonly readPreference: mongo.ReadPreference | undefined;
+  public readonly clearBatchThrottleRate: number;
   #storageInitialized = false;
+  /**
+   * Required for writing, optional for reading.
+   */
+  private readonly replicationLock: MongoSyncRulesLock | null;
 
   constructor(
     public readonly factory: MongoBucketStorage,
-    public readonly group_id: number,
-    protected readonly sync_rules: MongoPersistedSyncRulesContentV1,
-    public readonly slot_name: string,
+    public readonly replicationStreamId: number,
+    public readonly replicationStream: MongoPersistedReplicationStream,
+    public readonly replicationStreamName: string,
     writeCheckpointMode: storage.WriteCheckpointMode | undefined,
     options: MongoSyncBucketStorageOptions
   ) {
     super();
+    this.replicationLock = replicationStream.current_lock;
     this.storageConfig = options.storageConfig;
+    this.objectStorage = options.objectStorage;
+    // Keep small chunks inline in MongoDB rather than offloading them to S3.
+    // Configurable via object_storage.inline_threshold_bytes.
+    this.inlineThresholdBytes = options.inlineThresholdBytes ?? DEFAULT_INLINE_THRESHOLD_BYTES;
+    this.readPreference = options.readPreference;
+    this.clearBatchThrottleRate = options.clearBatchThrottleRate ?? DEFAULT_CLEAR_BATCH_THROTTLE_RATE;
     this.db = factory.db.versioned(this.storageConfig);
     this.checksums = this.createMongoChecksums(options);
-    this.writeCheckpointAPI = new MongoWriteCheckpointAPI({
+    this.writeCheckpointAPI = this.createWriteCheckpointAPI({
       db: this.db,
-      mode: writeCheckpointMode ?? storage.WriteCheckpointMode.MANAGED,
-      sync_rules_id: group_id
+      writeCheckpointMode: { mode: writeCheckpointMode ?? storage.WriteCheckpointMode.MANAGED },
+      replicationStreamId
     });
-    this.logger = sync_rules.logger;
+
+    // Include both replication stream name and sync config version labels in log prefix.
+    // Examples:
+    // No sync config with a label: [stream]
+    // All sync configs have a label: [stream][v5,v6]
+    // Mixed: [stream][?,v6]
+    const hasVersionLabel = replicationStream.syncConfigContent.some((config) => config.version_label != null);
+    const versionLabels = hasVersionLabel
+      ? replicationStream.syncConfigContent.map((config) => config.version_label ?? '?')
+      : [];
+    this.logger =
+      versionLabels.length == 0
+        ? replicationStream.logger
+        : defaultLogger.child({
+            prefix: `[${replicationStreamName}][${versionLabels.join(',')}] `
+          });
   }
 
   /**
@@ -108,58 +165,66 @@ export abstract class MongoSyncBucketStorage
   abstract createMongoCompactor(options: MongoCompactOptions): MongoCompactor;
 
   protected abstract createMongoChecksums(options: MongoSyncBucketStorageOptions): MongoChecksums;
+  protected createWriteCheckpointAPI(options: MongoCheckpointAPIOptions): MongoWriteCheckpointAPI {
+    return new MongoWriteCheckpointAPI(options);
+  }
+
   protected abstract createMongoParameterCompactor(
     checkpoint: InternalOpId,
     options: storage.CompactOptions
   ): MongoParameterCompactor;
 
+  /** MongoDB parameter compaction uses a persisted operation-id cursor. */
+  public supportsIncrementalParameterCompaction(): boolean {
+    return true;
+  }
+
   get writeCheckpointMode() {
     return this.writeCheckpointAPI.writeCheckpointMode;
   }
 
-  get mapping() {
-    return this.sync_rules.mapping;
+  /**
+   * Persisted storage ids of all sync configs in this replication stream. Parse-free.
+   */
+  get storageIds(): ReplicationStreamStorageIds {
+    return this.replicationStream.storageIds;
   }
 
-  protected get versionContext(): MongoSyncBucketStorageContext {
-    return {
-      db: this.db,
-      group_id: this.group_id,
-      mapping: this.mapping
-    };
+  setWriteCheckpointMode(config: storage.WriteCheckpointModeConfig): void {
+    this.writeCheckpointAPI.setWriteCheckpointMode(config);
   }
 
-  setWriteCheckpointMode(mode: storage.WriteCheckpointMode): void {
-    this.writeCheckpointAPI.setWriteCheckpointMode(mode);
-  }
-
-  createManagedWriteCheckpoint(checkpoint: storage.ManagedWriteCheckpointOptions): Promise<bigint> {
-    return this.writeCheckpointAPI.createManagedWriteCheckpoint(checkpoint);
+  createManagedWriteCheckpoints(
+    checkpoints: storage.ManagedWriteCheckpointOptions[]
+  ): Promise<storage.CreateManagedWriteCheckpointsResult> {
+    return this.writeCheckpointAPI.createManagedWriteCheckpoints(checkpoints);
   }
 
   lastWriteCheckpoint(filters: storage.SyncStorageLastWriteCheckpointFilters): Promise<bigint | null> {
     return this.writeCheckpointAPI.lastWriteCheckpoint({
       ...filters,
-      sync_rules_id: this.group_id
+      sync_rules_id: this.replicationStreamId
     });
   }
 
-  getParsedSyncRules(options: storage.ParseSyncRulesOptions): HydratedSyncConfig {
-    const { parsed, options: cachedOptions } = this.parsedSyncRulesCache ?? {};
-    if (!parsed || options.defaultSchema != cachedOptions?.defaultSchema) {
-      this.parsedSyncRulesCache = { parsed: this.sync_rules.parsed(options).hydratedSyncConfig(), options };
+  getParsedSyncConfigSet(options: storage.ParseSyncConfigOptions): MongoParsedSyncConfigSet {
+    let parsed = this.parsedSyncConfigSets.get(options.defaultSchema);
+    if (parsed == null) {
+      parsed = this.replicationStream.parsed(options);
+      this.parsedSyncConfigSets.set(options.defaultSchema, parsed);
     }
+    return parsed;
+  }
 
-    return this.parsedSyncRulesCache!.parsed;
+  getParsedSyncRules(options: storage.ParseSyncConfigOptions): HydratedSyncConfig {
+    return this.getParsedSyncConfigSet(options).hydratedSyncConfig;
   }
 
   async getCheckpoint(): Promise<storage.ReplicationCheckpoint> {
     return (await this.getCheckpointInternal()) ?? new EmptyReplicationCheckpoint();
   }
 
-  protected abstract fetchCheckpointState(
-    session: mongo.ClientSession
-  ): Promise<{ checkpoint: bigint; lsn: string | null } | null>;
+  protected abstract fetchCheckpointState(session: mongo.ClientSession): Promise<MongoCheckpointState | null>;
 
   async getCheckpointInternal(): Promise<storage.ReplicationCheckpoint | null> {
     return await this.db.client.withSession({ snapshot: true }, async (session) => {
@@ -169,10 +234,21 @@ export abstract class MongoSyncBucketStorage
       }
 
       const snapshotTime = (session as any).snapshotTime as bson.Timestamp | undefined;
+      const clusterTime = session.clusterTime;
       if (snapshotTime == null) {
         throw new ServiceAssertionError('Missing snapshotTime in getCheckpoint()');
       }
-      return new MongoReplicationCheckpoint(this, state.checkpoint, state.lsn, snapshotTime);
+      if (clusterTime == null) {
+        throw new ServiceAssertionError('Missing clusterTime in getCheckpoint()');
+      }
+      return new MongoReplicationCheckpoint(
+        this,
+        state.checkpoint,
+        state.lsn,
+        snapshotTime,
+        clusterTime,
+        state.parameterChangesInvalidBefore
+      );
     });
   }
 
@@ -183,37 +259,55 @@ export abstract class MongoSyncBucketStorage
       return;
     }
 
-    await this.db.initializeStreamStorage(this.group_id);
+    await this.db.initializeStreamStorage(this.replicationStreamId);
     await this.initializeVersionStorage();
     this.#storageInitialized = true;
   }
 
-  protected abstract createWriterImpl(batchOptions: MongoBucketBatchOptions): storage.BucketStorageBatch;
-  protected abstract getWriterSyncState(): Promise<WriterSyncState>;
+  /**
+   * Create the version-specific writer. Implementations fetch their own resume state
+   * (e.g. resume LSN, v1 keepalive op) and construct the batch from
+   * {@link writerBatchOptions} plus the version-specific fields.
+   */
+  protected abstract createWriterImpl(options: storage.CreateWriterOptions): Promise<storage.BucketStorageBatch>;
 
-  async createWriter(options: storage.CreateWriterOptions): Promise<storage.BucketStorageBatch> {
-    await this.initializeStorage();
-
-    const state = await this.getWriterSyncState();
-
-    const batchOptions: MongoBucketBatchOptions = {
+  /**
+   * The version-independent part of the batch options.
+   */
+  protected writerBatchOptions(options: storage.CreateWriterOptions): Omit<MongoBucketBatchOptions, 'resumeFromLsn'> {
+    const replicationLock = this.requireReplicationLock();
+    return {
       logger: options.logger ?? this.logger,
       db: this.db,
-      syncRules: this.sync_rules.parsed(options).hydratedSyncConfig(),
-      mapping: this.sync_rules.mapping,
-      groupId: this.group_id,
-      slotName: this.slot_name,
-      lastCheckpointLsn: state.lastCheckpointLsn,
-      resumeFromLsn: state.resumeFromLsn,
-      keepaliveOp: state.keepaliveOp,
+      parsedSyncConfig: this.getParsedSyncConfigSet(options),
+      replicationStreamId: this.replicationStreamId,
+      replicationStreamName: this.replicationStreamName,
+      replicationLock,
+      opIdAllocator: this.factory.getOpIdAllocator(this.replicationStream, replicationLock),
       storeCurrentData: options.storeCurrentData,
       skipExistingRows: options.skipExistingRows ?? false,
       markRecordUnavailable: options.markRecordUnavailable,
       hooks: options.hooks,
-      syncConfigId: state.syncConfigId,
-      tracer: options.tracer
+      tracer: options.tracer,
+      signal: options.signal,
+      objectStorage: this.objectStorage,
+      inlineThresholdBytes: this.inlineThresholdBytes
     };
-    const writer = this.createWriterImpl(batchOptions);
+  }
+
+  private requireReplicationLock(): MongoSyncRulesLock {
+    if (this.replicationLock == null) {
+      throw new ServiceAssertionError('A replication lease is required to create a writer');
+    }
+    this.replicationLock.throwIfAborted();
+    return this.replicationLock;
+  }
+
+  async createWriter(options: storage.CreateWriterOptions): Promise<storage.BucketStorageBatch> {
+    this.requireReplicationLock();
+    await this.initializeStorage();
+
+    const writer = await this.createWriterImpl(options);
     this.iterateListeners((cb) => cb.batchStarted?.(writer));
     return writer;
   }
@@ -243,24 +337,31 @@ export abstract class MongoSyncBucketStorage
   }
 
   protected abstract getBucketDataBatchImpl(
-    checkpoint: utils.InternalOpId,
+    checkpoint: MongoReplicationCheckpoint,
     dataBuckets: storage.BucketDataRequest[],
     options?: storage.BucketDataBatchOptions
-  ): AsyncIterable<storage.SyncBucketDataChunk>;
+  ): AsyncIterable<storage.SyncBucketDataChunk | storage.SyncBucketDataBatchEnd>;
 
   async *getBucketDataBatch(
-    checkpoint: utils.InternalOpId,
+    checkpoint: storage.ReplicationCheckpoint,
     dataBuckets: storage.BucketDataRequest[],
     options?: storage.BucketDataBatchOptions
-  ): AsyncIterable<storage.SyncBucketDataChunk> {
-    yield* this.getBucketDataBatchImpl(checkpoint, dataBuckets, options);
+  ): AsyncIterable<storage.SyncBucketDataChunk | storage.SyncBucketDataBatchEnd> {
+    yield* this.getBucketDataBatchImpl(checkpoint as MongoReplicationCheckpoint, dataBuckets, options);
   }
 
   async getChecksums(
-    checkpoint: utils.InternalOpId,
-    buckets: storage.BucketChecksumRequest[]
+    checkpoint: storage.ReplicationCheckpoint,
+    buckets: storage.BucketChecksumRequest[],
+    options?: storage.BucketChecksumOptions
   ): Promise<utils.ChecksumMap> {
-    return this.checksums.getChecksums(checkpoint, buckets);
+    const mongoCheckpoint = checkpoint as MongoReplicationCheckpoint;
+    const snapshotTime = mongoCheckpoint.snapshotTime; // May be undefined in tests
+    return this.checksums.getChecksums(checkpoint.checkpoint, buckets, {
+      snapshotTime,
+      clusterTime: mongoCheckpoint.clusterTime,
+      readPreference: options?.requestHint == 'bulk' ? this.readPreference : undefined
+    });
   }
 
   clearChecksumCache() {
@@ -277,9 +378,9 @@ export abstract class MongoSyncBucketStorage
     await this.db.notifyCheckpoint();
   }
 
-  protected abstract getStatusImpl(): Promise<storage.SyncRuleStatus>;
+  protected abstract getStatusImpl(): Promise<storage.ReplicationStreamStatus>;
 
-  async getStatus(): Promise<storage.SyncRuleStatus> {
+  async getStatus(): Promise<storage.ReplicationStreamStatus> {
     return this.getStatusImpl();
   }
 
@@ -292,6 +393,7 @@ export abstract class MongoSyncBucketStorage
   protected abstract clearBucketState(signal?: AbortSignal): Promise<void>;
 
   protected abstract clearSourceTables(signal?: AbortSignal): Promise<void>;
+  protected async clearCustomCheckpointRequests(_signal?: AbortSignal): Promise<void> {}
   protected abstract clearSyncRuleState(): Promise<void>;
 
   async clear(options?: storage.ClearStorageOptions): Promise<void> {
@@ -301,6 +403,7 @@ export abstract class MongoSyncBucketStorage
       throw new ReplicationAbortedError('Aborted clearing data', signal.reason);
     }
 
+    this.factory.discardOpIdAllocator(this.replicationStreamId);
     await this.clearSyncRuleState();
 
     await this.clearBucketData(signal);
@@ -308,32 +411,16 @@ export abstract class MongoSyncBucketStorage
     await this.clearSourceRecords(signal);
     await this.clearBucketState(signal);
     await this.clearSourceTables(signal);
+    await this.clearCustomCheckpointRequests(signal);
 
     this.#storageInitialized = false;
-  }
-
-  protected async clearDeleteMany(
-    label: string,
-    operation: () => Promise<mongo.DeleteResult>,
-    signal?: AbortSignal
-  ): Promise<void> {
-    await retryOnMongoMaxTimeMSExpired(operation, {
-      signal,
-      abortMessage: 'Aborted clearing data',
-      retryDelayMs: lib_mongo.db.MONGO_CLEAR_OPERATION_TIMEOUT_MS / 5,
-      onRetry: () => {
-        this.logger.info(
-          `Cleared batch of ${label} in ${lib_mongo.db.MONGO_CLEAR_OPERATION_TIMEOUT_MS}ms, continuing...`
-        );
-      }
-    });
   }
 
   async reportError(e: any): Promise<void> {
     const message = String(e.message ?? 'Replication failure');
     await this.db.sync_rules.updateOne(
       {
-        _id: this.group_id
+        _id: this.replicationStreamId
       },
       {
         $set: {
@@ -347,32 +434,29 @@ export abstract class MongoSyncBucketStorage
   async compact(options?: storage.CompactOptions) {
     let maxOpId = options?.maxOpId;
     if (maxOpId == null) {
+      // For PROCESSING streams, this will be undefined.
       const checkpoint = await this.getCheckpointInternal();
       maxOpId = checkpoint?.checkpoint ?? undefined;
     }
     await this.createMongoCompactor({ ...options, maxOpId, logger: this.logger }).compact();
 
-    if (maxOpId != null && options?.compactParameterData) {
-      await this.createMongoParameterCompactor(maxOpId, options).compact();
+    if (maxOpId != null && options?.compactParameterData && this.replicationStream.state == SyncRuleState.ACTIVE) {
+      // Use the stream-scoped logger, matching bucket compaction above.
+      await this.createMongoParameterCompactor(maxOpId, { ...options, logger: this.logger }).compact();
     }
   }
 
-  async populatePersistentChecksumCache(options: PopulateChecksumCacheOptions): Promise<PopulateChecksumCacheResults> {
-    this.logger.info(`Populating persistent checksum cache...`);
-    const start = Date.now();
-    const compactor = this.createMongoCompactor({
-      ...options,
-      memoryLimitMB: 0,
-      logger: this.logger
-    });
+  abstract compactInitialReplication(
+    options: CompactInitialReplicationOptions
+  ): Promise<CompactInitialReplicationResults>;
 
-    const result = await compactor.populateChecksums({
-      minBucketChanges: options.minBucketChanges ?? 10
-    });
-    const duration = Date.now() - start;
-    this.logger.info(`Populated persistent checksum cache in ${(duration / 1000).toFixed(1)}s`);
-    return result;
-  }
+  /**
+   * The highest op id persisted for this stream, whether or not covered by a checkpoint.
+   *
+   * Used as the default `maxOpId` for {@link compactInitialReplication}, which runs after
+   * initial replication but before the first checkpoint exists.
+   */
+  protected abstract fetchPersistedOpHead(): Promise<InternalOpId | null>;
 
   private async *watchActiveCheckpoint(signal: AbortSignal): AsyncIterable<ReplicationCheckpoint> {
     if (signal.aborted) {
@@ -413,7 +497,7 @@ export abstract class MongoSyncBucketStorage
     for await (const nextCheckpoint of iter) {
       if (nextCheckpoint.lsn != null && !queriedInitialWriteCheckpoint) {
         writeCheckpoint = await this.writeCheckpointAPI.lastWriteCheckpoint({
-          sync_rules_id: this.group_id,
+          sync_rules_id: this.replicationStreamId,
           user_id: options.user_id,
           heads: {
             '1': nextCheckpoint.lsn
@@ -446,7 +530,7 @@ export abstract class MongoSyncBucketStorage
         let updatedWriteCheckpoint = updates.updatedWriteCheckpoints.get(options.user_id) ?? null;
         if (updates.invalidateWriteCheckpoints) {
           updatedWriteCheckpoint = await this.writeCheckpointAPI.lastWriteCheckpoint({
-            sync_rules_id: this.group_id,
+            sync_rules_id: this.replicationStreamId,
             user_id: options.user_id,
             heads: {
               '1': nextCheckpoint.lsn!
@@ -550,13 +634,31 @@ export abstract class MongoSyncBucketStorage
   }
 
   protected abstract getParameterBucketChangesImpl(
-    options: GetCheckpointChangesOptions
+    options: MongoGetCheckpointChangesOptions
   ): Promise<Pick<CheckpointChanges, 'updatedParameterLookups' | 'invalidateParameterBuckets'>>;
 
   private async getParameterBucketChanges(
     options: GetCheckpointChangesOptions
   ): Promise<Pick<CheckpointChanges, 'updatedParameterLookups' | 'invalidateParameterBuckets'>> {
-    return this.getParameterBucketChangesImpl(options);
+    const nextCheckpoint = requireMongoCheckpoint(options.nextCheckpoint);
+    if (options.lastCheckpoint.checkpoint < nextCheckpoint.parameterChangesInvalidBefore) {
+      // Parameter compaction may have deleted parameter entries in the range we'd have to query
+      // to find the individual changed lookups. Invalidate all parameter buckets instead.
+      //
+      // The fence is committed before the first delete of a compaction pass, and captured in the
+      // same snapshot as the checkpoint, so a checkpoint that could miss a deleted entry always
+      // observes the fence as well.
+      return {
+        invalidateParameterBuckets: true,
+        updatedParameterLookups: new Set<string>()
+      };
+    }
+    // The query below runs at the checkpoint snapshot, which still sees entries deleted by a
+    // compaction pass that started after the snapshot.
+    return this.getParameterBucketChangesImpl({
+      lastCheckpoint: options.lastCheckpoint,
+      nextCheckpoint
+    });
   }
 
   private checkpointChangesCache = new LRUCache<
@@ -566,6 +668,9 @@ export abstract class MongoSyncBucketStorage
   >({
     max: 50,
     maxSize: 12 * 1024 * 1024,
+    // When we have more fetches than the cache size, complete the fetches instead
+    // of failing with Error('evicted').
+    ignoreFetchAbort: true,
     sizeCalculation: (value: InternalCheckpointChanges) => {
       const paramSize = [...value.updatedParameterLookups].reduce<number>((a, b) => a + b.length, 0);
       const bucketSize = [...value.updatedDataBuckets].reduce<number>((a, b) => a + b.length, 0);
@@ -578,7 +683,10 @@ export abstract class MongoSyncBucketStorage
   });
 
   async getCheckpointChanges(options: GetCheckpointChangesOptions): Promise<InternalCheckpointChanges> {
-    const key = `${options.lastCheckpoint.checkpoint}_${options.lastCheckpoint.lsn}__${options.nextCheckpoint.checkpoint}_${options.nextCheckpoint.lsn}`;
+    // The invalidation fence is part of the identity: the same checkpoint pair read before and
+    // after a compaction pass produces different results (specific lookups vs. invalidate-all).
+    const fence = requireMongoCheckpoint(options.nextCheckpoint).parameterChangesInvalidBefore;
+    const key = `${options.lastCheckpoint.checkpoint}_${options.lastCheckpoint.lsn}__${options.nextCheckpoint.checkpoint}_${options.nextCheckpoint.lsn}_${fence}`;
     const result = await this.checkpointChangesCache.fetch(key, { context: { options } });
     return result!;
   }
@@ -596,14 +704,29 @@ export abstract class MongoSyncBucketStorage
   }
 }
 
-class MongoReplicationCheckpoint implements ReplicationCheckpoint {
+/**
+ * We don't support any other constructions of ReplicationCheckpoint.
+ */
+function requireMongoCheckpoint(checkpoint: ReplicationCheckpoint): MongoReplicationCheckpoint {
+  if (!(checkpoint instanceof MongoReplicationCheckpoint)) {
+    throw new ServiceAssertionError(
+      `Checkpoint changes require a checkpoint from getCheckpointInternal(), got ${checkpoint.constructor.name}`
+    );
+  }
+  return checkpoint;
+}
+
+class MongoReplicationCheckpoint implements MongoSyncBucketStorageCheckpoint {
   #storage: MongoSyncBucketStorage;
 
   constructor(
     storage: MongoSyncBucketStorage,
     public readonly checkpoint: InternalOpId,
     public readonly lsn: string | null,
-    public snapshotTime: mongo.Timestamp
+    public snapshotTime: mongo.Timestamp,
+    public clusterTime: mongo.ClusterTime,
+    /** Captured in the same snapshot as the checkpoint. */
+    public readonly parameterChangesInvalidBefore: InternalOpId
   ) {
     this.#storage = storage;
   }
@@ -613,11 +736,15 @@ class MongoReplicationCheckpoint implements ReplicationCheckpoint {
   }
 }
 
+/**
+ * Used when no checkpoint has been persisted yet. This has no snapshot or invalidation fence, so
+ * it cannot be used for checkpoint change detection - see {@link requireMongoCheckpoint}.
+ */
 class EmptyReplicationCheckpoint implements ReplicationCheckpoint {
   readonly checkpoint: InternalOpId = 0n;
   readonly lsn: string | null = null;
 
-  async getParameterSets(_lookups: ScopedParameterLookup[]): Promise<ParameterLookupRows[]> {
+  async getParameterSets(_lookups: ScopedParameterLookup[], _limit: number): Promise<ParameterLookupRows[]> {
     return [];
   }
 }

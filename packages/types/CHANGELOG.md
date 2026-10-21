@@ -1,5 +1,73 @@
 # @powersync/service-types
 
+## 0.20.0
+
+### Minor Changes
+
+- 44ce423: Add `config.source_table_options` to edition 3 sync configs, including MongoDB pre-filtering expressions. Generate editor schemas with examples and report validation errors at their YAML source locations.
+
+  MongoDB replication pre-filtering is not supported in the Open Edition; unsupported configurations report `PSYNC_S1348`. For example:
+
+  ```yaml
+  config:
+    edition: 3
+    source_table_options:
+      orders:
+        mongodb_filter_expression:
+          $and:
+            - $eq: ['$$doc.active', true]
+            - $in: ['$$doc.status', ['pending', 'shipped']]
+  streams:
+    orders:
+      query: SELECT * FROM orders
+  ```
+
+  Validation and deployment reject filters when the feature is unavailable. Parsing accepts an optional map of connection tags to connection types, rejecting MongoDB pre-filtering expressions on known non-MongoDB sources. Unknown connections or missing connection metadata produce advisory warnings. The service supplies connection metadata during validation, deployment, and filesystem loading. Filesystem-loaded sync configs also run source-capability checks. With `exit_on_error` disabled, configs remain available to diagnostics. Changing source-table options requires replacement processing when deploying a new sync config.
+
+  Source capability validation returns structured `ValidationDiagnostic` entries, allowing multiple fatal issues and
+  advisory warnings. Deployment and reprocessing reject fatal diagnostics while validation continues collecting
+  independent findings. Existing `ReplicationError` consumers retain the same diagnostic shape.
+
+- 51a1a89: Add `sync_config_source` and `ServiceInfo` to `DiagnosticsResponse`.
+
+## 0.19.0
+
+### Minor Changes
+
+- 5078032: Change the default MongoDB storage version from 2 to 4.
+
+## 0.18.0
+
+### Minor Changes
+
+- 33a3c23: Add optional version_label for sync configs.
+
+### Patch Changes
+
+- fccdff2: Add object storage metrics, and storage metrics split by sync config.
+- 4e4063b: Optimize runtime type checks, closes https://github.com/powersync-ja/powersync-service/issues/771.
+- 4037e8f: Add storage.default_storage_version config option.
+
+## 0.17.0
+
+### Minor Changes
+
+- 2189250: Add `/sync/checkpoint-request` for client-supplied checkpoint request ids, previously called write checkpoint ids. The route returns the stored `checkpoint_request_id`, storage now treats managed request ids as monotonic per user/client, custom checkpoint request ids continue to use the existing `checkpoint` field for backwards compatibility, and `checkpoint_requested_at` metadata lets compact jobs remove expired request-derived checkpoint records.
+
+  This release includes storage migrations for the checkpoint request metadata. Self-hosters should run migrations as part of the upgrade.
+
+## 0.16.1
+
+### Patch Changes
+
+- c2edf86: Add `api.parameters.bucket_count_cache_ttl_minutes` configuration option.
+
+## 0.16.0
+
+### Minor Changes
+
+- a91a08f: [Experimental] Enable incremental reprocessing for MongoDB source + MongoDB storage. This includes significant changes to the v3 storage format.
+
 ## 0.15.2
 
 ### Patch Changes

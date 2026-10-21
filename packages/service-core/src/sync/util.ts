@@ -2,6 +2,7 @@ import * as timers from 'timers/promises';
 
 import { SemaphoreInterface } from 'async-mutex';
 import { serialize } from 'bson';
+import { AbortError } from 'ix/aborterror.js';
 import * as util from '../util/util-index.js';
 import { RequestTracker } from './RequestTracker.js';
 
@@ -22,6 +23,17 @@ const DEFAULT_TOKEN_STREAM_OPTIONS: TokenStreamOptions = {
   keep_alive: true,
   expire_warning_period: 20_000
 };
+
+/**
+ * Recognize both ix's AbortError and native abort errors, which Node represents
+ * as DOMExceptions with the name "AbortError".
+ */
+export function isAbortError(error: unknown): boolean {
+  return (
+    error instanceof AbortError ||
+    (typeof error == 'object' && error != null && 'name' in error && error.name === 'AbortError')
+  );
+}
 
 /**
  * An iterator that periodically yields token and optionally keepalive events, and returns once the
@@ -132,9 +144,19 @@ export async function* transformToBytesTracked(
 
 export function acquireSemaphoreAbortable(
   semaphone: SemaphoreInterface,
-  abort: AbortSignal
+  abort?: AbortSignal
 ): Promise<[number, SemaphoreInterface.Releaser] | 'aborted'> {
+  if (abort == null) {
+    return semaphone.acquire();
+  }
   return new Promise((resolve, reject) => {
+    // An already-aborted signal never fires its listener, and we would wait for the semaphore
+    // indefinitely.
+    if (abort.aborted) {
+      resolve('aborted');
+      return;
+    }
+
     let aborted = false;
     let hasSemaphore = false;
 
@@ -147,16 +169,22 @@ export function acquireSemaphoreAbortable(
     };
     abort.addEventListener('abort', listener);
 
-    semaphone.acquire().then((acquired) => {
-      hasSemaphore = true;
-      if (aborted) {
-        // Release semaphore, already aborted
-        acquired[1]();
-      } else {
+    semaphone.acquire().then(
+      (acquired) => {
+        hasSemaphore = true;
+        if (aborted) {
+          // Release semaphore, already aborted
+          acquired[1]();
+        } else {
+          abort.removeEventListener('abort', listener);
+          resolve(acquired);
+        }
+      },
+      (error) => {
         abort.removeEventListener('abort', listener);
-        resolve(acquired);
+        reject(error);
       }
-    }, reject);
+    );
   });
 }
 

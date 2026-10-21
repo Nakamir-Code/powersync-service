@@ -1,15 +1,23 @@
 import crypto from 'crypto';
 
 import { mongo } from '@powersync/lib-service-mongodb';
-import { ErrorCode, Logger, ServiceError } from '@powersync/lib-services-framework';
-import { storage } from '@powersync/service-core';
+import { ErrorCode, Logger, ReplicationAbortedError, ServiceError } from '@powersync/lib-services-framework';
+import { storage, utils } from '@powersync/service-core';
 import { VersionedPowerSyncMongo } from './db.js';
+
+const LOCK_DURATION_MS = 60 * 1000;
 
 /**
  * Manages a lock on a replication stream document, so that only one process
  * processes that replication stream at a time.
  */
 export class MongoSyncRulesLock implements storage.ReplicationLock {
+  /** FIFO admission shared by this lease's writers; database fencing still enforces ownership. */
+  readonly writerMutex = new utils.Mutex();
+
+  private readonly abort = new AbortController();
+  readonly signal = this.abort.signal;
+
   private readonly refreshInterval: NodeJS.Timeout;
 
   /**
@@ -17,20 +25,25 @@ export class MongoSyncRulesLock implements storage.ReplicationLock {
    */
   static async createLock(
     db: VersionedPowerSyncMongo,
-    sync_rules: storage.PersistedSyncRulesContent,
+    sync_rules: storage.PersistedReplicationStream,
     session?: mongo.ClientSession
   ): Promise<MongoSyncRulesLock> {
     const lockId = crypto.randomBytes(8).toString('hex');
     const doc = await db.sync_rules.findOneAndUpdate(
-      { _id: sync_rules.id, $or: [{ lock: null }, { 'lock.expires_at': { $lt: new Date() } }] },
       {
-        $set: {
-          lock: {
-            id: lockId,
-            expires_at: new Date(Date.now() + 60 * 1000)
+        _id: sync_rules.replicationStreamId,
+        $or: [{ lock: null }, { $expr: { $lt: ['$lock.expires_at', '$$NOW'] } }]
+      },
+      [
+        {
+          $set: {
+            lock: {
+              id: lockId,
+              expires_at: { $dateAdd: { startDate: '$$NOW', unit: 'millisecond', amount: LOCK_DURATION_MS } }
+            }
           }
         }
-      },
+      ],
       {
         projection: { lock: 1 },
         returnDocument: 'before',
@@ -40,7 +53,10 @@ export class MongoSyncRulesLock implements storage.ReplicationLock {
 
     if (doc == null) {
       // Query the existing lock to get the expiration time (best effort - it may have been released in the meantime).
-      const heldLock = await db.sync_rules.findOne({ _id: sync_rules.id }, { projection: { lock: 1 }, session });
+      const heldLock = await db.sync_rules.findOne(
+        { _id: sync_rules.replicationStreamId },
+        { projection: { lock: 1 }, session }
+      );
       if (heldLock?.lock?.expires_at) {
         throw new ServiceError(
           ErrorCode.PSYNC_S1003,
@@ -51,19 +67,20 @@ export class MongoSyncRulesLock implements storage.ReplicationLock {
       }
     }
     sync_rules.logger.info(`Locked replication stream for processing`);
-    return new MongoSyncRulesLock(db, sync_rules.id, lockId, sync_rules.logger);
+    return new MongoSyncRulesLock(db, sync_rules.replicationStreamId, lockId, sync_rules.logger);
   }
 
   constructor(
     private db: VersionedPowerSyncMongo,
     public sync_rules_id: number,
-    private lock_id: string,
+    public readonly lock_id: string,
     private logger: Logger
   ) {
     this.refreshInterval = setInterval(async () => {
       try {
         await this.refresh();
       } catch (e) {
+        this.abort.abort(e);
         this.logger.error('Failed to refresh lock', e);
         clearInterval(this.refreshInterval);
       }
@@ -71,6 +88,7 @@ export class MongoSyncRulesLock implements storage.ReplicationLock {
   }
 
   async release(): Promise<void> {
+    this.abort.abort(new Error('Replication lock released'));
     clearInterval(this.refreshInterval);
     const result = await this.db.sync_rules.updateOne(
       {
@@ -87,15 +105,66 @@ export class MongoSyncRulesLock implements storage.ReplicationLock {
     }
   }
 
+  throwIfAborted(): void {
+    this.signal.throwIfAborted();
+  }
+
+  static ownerFilter(streamId: number, lock: MongoSyncRulesLock) {
+    lock.throwIfAborted();
+    return { _id: streamId, 'lock.id': lock.lock_id };
+  }
+
+  static heartbeatUpdate() {
+    // Always change the existing heartbeat, even for writes in the same
+    // millisecond. A no-op update is not sufficient for a transactional fence.
+    return {
+      last_keepalive_ts: {
+        $max: ['$$NOW', { $add: [{ $ifNull: ['$last_keepalive_ts', new Date(0)] }, 1] }]
+      }
+    };
+  }
+
+  static assertOwned<T>(document: T | null): T {
+    if (document == null) {
+      throw new ReplicationAbortedError('Replication writer no longer owns the stream');
+    }
+    return document;
+  }
+
+  /**
+   * A write, not just an ownership read: takeover conflicts with every transaction
+   * that publishes under this owner. Every writer must hold a stream lease.
+   */
+  static async fence(
+    db: VersionedPowerSyncMongo,
+    streamId: number,
+    lock: MongoSyncRulesLock,
+    session: mongo.ClientSession,
+    projection: mongo.Document = { last_persisted_op: 1, last_checkpoint: 1, keepalive_op: 1 }
+  ) {
+    const doc = await db.sync_rules.findOneAndUpdate(
+      this.ownerFilter(streamId, lock),
+      [{ $set: this.heartbeatUpdate() }],
+      { session, returnDocument: 'after', projection }
+    );
+    return this.assertOwned(doc);
+  }
+
   private async refresh(): Promise<void> {
     const result = await this.db.sync_rules.findOneAndUpdate(
       {
         _id: this.sync_rules_id,
         'lock.id': this.lock_id
       },
-      {
-        $set: { 'lock.expires_at': new Date(Date.now() + 60 * 1000) }
-      },
+      [
+        {
+          $set: {
+            'lock.expires_at': {
+              $dateAdd: { startDate: '$$NOW', unit: 'millisecond', amount: LOCK_DURATION_MS }
+            }
+          }
+        }
+      ],
       { returnDocument: 'after' }
     );
     if (result == null) {

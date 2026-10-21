@@ -1,0 +1,204 @@
+# Sync Protocol
+
+This document is a work in progress - more details to be added over time.
+
+# Sync stream
+
+A sync stream contains 6 possible messages:
+
+## StreamingSyncCheckpoint
+
+Format:
+
+```ts
+{
+  checkpoint: {
+    last_op_id: OpId;
+    write_checkpoint?: OpId;
+    buckets: BucketChecksum[];
+  }
+}
+```
+
+This indicates a new checkpoint is available, along with checksums for each bucket in the checkpoint.
+
+`write_checkpoint` acknowledges a checkpoint request. The field keeps its legacy
+name for backwards compatibility with older clients and servers.
+
+This is typically (but not necessarily) be the first message in the response, and is often followed by StreamingSyncData and StreamingSyncCheckpointComplete (both optional).
+
+## StreamingSyncCheckpointDiff
+
+This has the same conceptual meaning as a StreamingSyncCheckpoint. It is an optimization to only send details for buckets that changed, instead of sending the entire checkpoint over.
+
+Format:
+
+```ts
+{
+  checkpoint_diff: {
+    last_op_id: OpId;
+    write_checkpoint?: OpId;
+    updated_buckets: BucketChecksum[];
+    removed_buckets: string[];
+  }
+}
+```
+
+Typically a sync stream would contain a single StreamingSyncCheckpoint, and then after that only StreamingSyncCheckpointDiff messages. However, the server may send any number of StreamingSyncCheckpoint messags after that, each time "resetting" the checkpoint state.
+
+## StreamingSyncData
+
+This message contains data for a single bucket.
+
+Format:
+
+```ts
+{
+  data: SyncBucketData;
+}
+```
+
+While this data is typically associated with the last checkpoint sent, it may be sent at any other time, and may contain data outside the last checkpoint boundaries.
+
+## StreamingSyncCheckpointComplete
+
+This message indicates that all data has been sent for the last checkpoint.
+
+Format:
+
+```ts
+{
+  checkpoint_complete: {
+    last_op_id: OpId;
+  }
+}
+```
+
+`last_op_id` here _must_ match the `last_op_id` of the last `StreamingSyncCheckpoint` or `StreamingSyncCheckpointDiff` message sent.
+
+It is not required to have one `StreamingSyncCheckpointComplete` message for every `StreamingSyncCheckpoint` or `StreamingSyncCheckpointDiff`. In some cases, a checkpoint may be invalidated while data were being sent, in which case no matching `StreamingSyncCheckpointComplete` will be sent. Instead, another `StreamingSyncCheckpoint` or `StreamingSyncCheckpointDiff` will be sent with a new checkpoint.
+
+### StreamingSyncPartialCheckpointComplete
+
+When a tracked checkpoint (from the last [checkpoint](#streamingsynccheckpoint) or [diff checkpoint](#streamingsynccheckpointdiff))
+contains buckets in different priorities, the service sends ([data lines](#streamingsyncdata)) in priority order, starting with higher-priority
+buckets.
+
+Between data lines of different priorities, the service emits a partial checkpoint complete message:
+
+Format:
+
+```ts
+{
+  partial_checkpoint_complete: {
+    last_op_id: OpId;
+    priority: BucketPriority /* 0 | 1 | 2 | 3 */;
+  }
+}
+```
+
+Clients can use this to sync changes for a subset of buckets before having to download everything else.
+
+> [!IMPORTANT]
+> Buckets with the highest priority `0` [behave differently](https://docs.powersync.com/sync/streams/prioritized-sync#special-case-priority-0)
+> on the client. Clients need to recognize the case where a checkpoint consists of priority `0` buckets only, as no partial complete
+> message is sent in that case.
+
+Additionally, the service _may_ interrupt sending lower-priority data lines once a change in a higher-priority bucket is detected.
+In this cases, a new `StreamingSyncCheckpointDiff` line is sent before a (partial) complete message.
+
+## StreamingSyncKeepalive
+
+Serves as both a general keepalive message to keep the stream open, and an indication of how long before the current token expires.
+
+Format:
+
+```ts
+{
+  token_expires_in: number;
+}
+```
+
+# Bucket operations
+
+## PUT
+
+Includes contents for an entire row.
+
+The row is uniquely identified using the combination of (object_type, object_id, subkey).
+
+Another PUT or REMOVE operation with the same `(object_type, object_id, subkey)` _replaces_
+this operation.
+
+Another PUT or REMOVE operation with the same `(object_type, object_id, subkey)` but a different `subkey` _does not_ directly replace this one, and may exist concurrently.
+
+Format:
+
+```ts
+{
+  op_id: OpId;
+  op: 'PUT';
+  object_type: string;
+  object_id: string;
+  data: string;
+  checksum: number;
+  subkey?: string;
+}
+```
+
+## REMOVE
+
+Indicates that a row is removed from a bucket.
+
+The row is uniquely identified using the combination of (object_type, object_id, subkey).
+
+Another PUT or REMOVE operation with the same `(object_type, object_id, subkey)` _replaces_
+this operation.
+
+Format:
+
+```ts
+{
+  op_id: OpId;
+  op: 'REMOVE';
+  object_type: string;
+  object_id: string;
+  checksum: number;
+  subkey?: string;
+}
+```
+
+## MOVE
+
+Indicates a "tombstone" operation - an operation that has been replaced by another one.
+The checksum of the operation is unchanged.
+
+Format:
+
+```ts
+{
+  op_id: OpId;
+  op: 'MOVE';
+  checksum: number;
+}
+```
+
+A previous iteration of the protocol included an optional `data: '{"target": OpId}'` field. This was to indicate a checkpoint is not valid unless its op_id is greater than or equal to the target. Now, the server is responsible for invalidating checkpoints in those cases, by not sending a `CheckpointComplete` in that case.
+
+## CLEAR
+
+Indicates a "reset point" of a bucket. All operations prior to this bucket must be removed.
+
+If the client has any active PUT operations prior to a CLEAR operation, those should effectively be converted into REMOVE operations.
+
+The checksum of this operation is equal to the combined checksum of all prior operations it replaced.
+
+Format:
+
+```ts
+{
+  op_id: OpId;
+  op: 'CLEAR';
+  checksum: number;
+}
+```

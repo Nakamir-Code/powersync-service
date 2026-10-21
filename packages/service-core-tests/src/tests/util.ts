@@ -8,15 +8,28 @@ import {
 } from '@powersync/service-sync-rules';
 import { bucketRequest } from '../test-utils/general-utils.js';
 
+/**
+ * Resolve storage again after test writes activate the sync config. The storage
+ * instance used by the writer retains its original PROCESSING stream snapshot,
+ * while compact() expects an instance constructed with the current state.
+ */
+export async function compactActive(factory: storage.BucketStorageFactory, options: storage.CompactOptions) {
+  const active = await factory.getActiveSyncConfig();
+  if (active == null) {
+    throw new Error('Expected an active sync config before compacting');
+  }
+  await active.storage.compact(options);
+}
+
 export function bucketRequestMap(
-  syncRules: storage.PersistedSyncRulesContent,
+  syncRules: storage.PersistedSyncConfigContent,
   buckets: Iterable<readonly [string, bigint]>
 ): storage.BucketDataRequest[] {
   return Array.from(buckets, ([bucketName, opId]) => bucketRequest(syncRules, bucketName, opId));
 }
 
 export function bucketRequests(
-  syncRules: storage.PersistedSyncRulesContent,
+  syncRules: storage.PersistedSyncConfigContent,
   bucketNames: string[]
 ): storage.BucketChecksumRequest[] {
   return bucketNames.map((bucketName) => {

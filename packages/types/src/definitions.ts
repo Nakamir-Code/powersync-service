@@ -1,4 +1,10 @@
 import * as t from 'ts-codec';
+import { enumLiteral, orNull } from './codecs.js';
+
+export const ServiceInfo = t.object({
+  version: t.string
+});
+export type ServiceInfo = t.Encoded<typeof ServiceInfo>;
 
 export const SourceSpan = t.object({
   start_offset: t.number,
@@ -6,14 +12,22 @@ export const SourceSpan = t.object({
 });
 export type SourceSpan = t.Encoded<typeof SourceSpan>;
 
-export const ReplicationError = t.object({
-  /** Warning: Could indicate an issue. Fatal: Prevents replicating. */
-  level: t.literal('warning').or(t.literal('fatal')),
+export const ValidationDiagnostic = t.object({
+  /**
+   * Warnings are advisory; fatal diagnostics prevent the requested operation.
+   */
+  level: enumLiteral('warning', 'fatal'),
   message: t.string,
   location: SourceSpan.optional(),
   ts: t.string.optional()
 });
-export type ReplicationError = t.Encoded<typeof ReplicationError>;
+export type ValidationDiagnostic = t.Encoded<typeof ValidationDiagnostic>;
+
+/**
+ * Replication status uses the shared diagnostic shape.
+ */
+export const ReplicationError = ValidationDiagnostic;
+export type ReplicationError = ValidationDiagnostic;
 
 export const TableInfo = t.object({
   schema: t.string,
@@ -35,6 +49,10 @@ export const TableInfo = t.object({
 export type TableInfo = t.Encoded<typeof TableInfo>;
 
 export const SyncRulesStatus = t.object({
+  /**
+   * Optional label identifying this deployed sync config version.
+   */
+  version_label: orNull(t.string).optional(),
   content: t.string.optional(),
   connections: t.array(
     t.object({

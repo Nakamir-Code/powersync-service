@@ -1,3 +1,4 @@
+import { getTestStorage } from '@powersync/service-core-tests';
 import * as bson from 'bson';
 import { afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { WalStream, WalStreamOptions } from '../../src/replication/WalStream.js';
@@ -18,7 +19,6 @@ import { PgManager } from '@module/replication/PgManager.js';
 import { ReplicationAbortedError } from '@powersync/lib-services-framework';
 import {
   createCoreReplicationMetrics,
-  CURRENT_STORAGE_VERSION,
   initializeCoreReplicationMetrics,
   reduceBucket,
   updateSyncRulesFromYaml
@@ -34,7 +34,7 @@ describe.skipIf(!(env.CI || env.SLOW_TESTS))('slow tests', function () {
     {
       timeout: 120_000,
       // These tests are slow, so only test the current storage version
-      storageVersions: [CURRENT_STORAGE_VERSION]
+      storageVersions: 'current'
     },
     function ({ factory, storageVersion }) {
       defineSlowTests({ factory, storageVersion });
@@ -94,10 +94,11 @@ bucket_definitions:
   global:
     data:
       - SELECT * FROM "test_data"
-`;
+    `;
     const syncRules = await f.updateSyncRules(updateSyncRulesFromYaml(syncRuleContent, { storageVersion }));
-    const storage = f.getInstance(syncRules);
-    const helpers = new StorageDataHelpers(storage, syncRules);
+    const storage = await getTestStorage(f, syncRules);
+    const syncRulesContent = syncRules.syncConfigContent[0];
+    const helpers = new StorageDataHelpers(storage, syncRulesContent);
     abortController = new AbortController();
     const options: WalStreamOptions = {
       abort_signal: abortController.signal,
@@ -182,10 +183,15 @@ bucket_definitions:
             break;
           }
 
-          const checkpoint = (await storage.getCheckpoint()).checkpoint;
-          const opsBefore = await helpers.getBucketData('global[]', checkpoint);
-          await storage.compact({ maxOpId: checkpoint });
-          const opsAfter = await helpers.getBucketData('global[]', checkpoint);
+          const active = await f.getActiveSyncConfig();
+          if (active == null) {
+            continue;
+          }
+          const activeHelpers = new StorageDataHelpers(active.storage, syncRulesContent);
+          const checkpoint = await active.storage.getCheckpoint();
+          const opsBefore = await activeHelpers.getBucketData('global[]', checkpoint);
+          await active.storage.compact({ maxOpId: checkpoint.checkpoint });
+          const opsAfter = await activeHelpers.getBucketData('global[]', checkpoint);
 
           test_utils.validateCompactedBucket(opsBefore, opsAfter);
         }
@@ -251,7 +257,7 @@ bucket_definitions:
       }
 
       // Check that each PUT has a REMOVE
-      const checkpoint = (await storage.getCheckpoint()).checkpoint;
+      const checkpoint = await storage.getCheckpoint();
       const ops = await helpers.getBucketData('global[]', checkpoint);
 
       const reduced = test_utils.reduceBucket(ops);
@@ -291,7 +297,7 @@ bucket_definitions:
 `;
 
     const syncRules = await f.updateSyncRules(updateSyncRulesFromYaml(syncRuleContent, { storageVersion }));
-    const storage = f.getInstance(syncRules);
+    const storage = await getTestStorage(f, syncRules);
 
     // 1. Setup some base data that will be replicated in initial replication
     await pool.query(`CREATE TABLE test_data(id uuid primary key default uuid_generate_v4(), description text)`);

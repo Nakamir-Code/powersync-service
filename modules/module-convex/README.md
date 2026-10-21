@@ -118,9 +118,9 @@ The content below is written in an agents.md style describing the behavior of `m
 - Stream row conversion uses the JSON document returned by `list_snapshot` and `document_deltas`, not Convex `json_schemas` metadata. Added fields, removed fields, and type changes are therefore replicated through normal document mutations.
 - Convex data migrations are expected to run as writes/mutations over live documents. Those updates should appear in `document_deltas` and be replicated without a schema-driven re-snapshot.
 - Exact table patterns are resolved directly from Sync Streams rules. `json_schemas` is only used for initial wildcard table expansion and API/debug schema previews.
-- A re-snapshot is still required for initial replication, a sync-rule deployment that selects new existing data, or a lost/expired cursor, but not merely because a Convex field was added, removed, or changed type.
-- Table drops are not (yet) detected by continuously diffing `json_schemas`. Validation showed that deleting a table from the Convex dashboard does not emit per-document `_deleted` rows in `document_deltas`, so previously replicated rows can remain synced to clients. Use the dashboard "Clear Table" action before deleting a table, or delete documents through mutation paths that emit document deltas. Otherwise, handle dashboard/schema-only table removal as a sync-rule/deployment state change and clear/re-replicate affected PowerSync state.
-- See [Convex schema change handling](../../docs/convex/schema-change-handling.md) for the detailed rationale and limitations.
+- A re-snapshot is still required for initial replication, a sync config deployment that selects new existing data, or a lost/expired cursor, but not merely because a Convex field was added, removed, or changed type.
+- Table drops are not (yet) detected by continuously diffing `json_schemas`. Validation showed that deleting a table from the Convex dashboard does not emit per-document `_deleted` rows in `document_deltas`, so previously replicated rows can remain synced to clients. Use the dashboard "Clear Table" action before deleting a table, or delete documents through mutation paths that emit document deltas. Otherwise, handle dashboard/schema-only table removal as a sync config or deployment state change and clear/re-replicate affected PowerSync state.
+- See [Convex schema change handling](../../docs/modules/convex/schema-change-handling.md) for the detailed rationale and limitations.
 
 ## 7) Datatype Mapping
 
@@ -148,11 +148,11 @@ The content below is written in an agents.md style describing the behavior of `m
 
 ## 8) Checkpointing and Consistency
 
-- `createReplicationHead` must:
+- Managed write checkpoint creation must:
   1. resolve global head cursor,
-  2. pass that head to the callback so PowerSync stores the managed write checkpoint mapping,
-  3. then write a Convex checkpoint marker via `POST /api/mutation` (calls `powersync_checkpoints:createCheckpoint`).
-- The marker must be written after the callback. If the marker is replicated before the managed write checkpoint mapping exists, an idle source can still leave the client waiting for a later observable checkpoint update.
+  2. store any managed write checkpoint mapping for that head,
+  3. then write a Convex checkpoint marker via `POST /api/mutation` (calls `powersync_checkpoints:createCheckpoint`) only if storage advanced a checkpoint.
+- The marker must be written after the mapping is stored. If the marker is replicated before the managed write checkpoint mapping exists, an idle source can still leave the client waiting for a later observable checkpoint update.
 - Source marker table: `powersync_checkpoints`
   - Convex rejects table names starting with `_`, so no leading-underscore variant is used.
   - The table has a single `last_updated` field; the mutation upserts one row (bounded to one row total).

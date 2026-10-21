@@ -4,15 +4,15 @@ import { ExternalData, SqlExpression } from '../sync_plan/expression.js';
 import { ExpressionToSqlite } from '../sync_plan/expression_to_sql.js';
 import { RecursiveExpressionVisitor } from '../sync_plan/expression_visitor.js';
 import { ConnectionParameterSource } from '../sync_plan/plan.js';
-import { EqualsIgnoringResultSet, equalsIgnoringResultSetList } from './compatibility.js';
+import { EqualsIgnoringPrimaryResultSet, TableValuedFunctionEquality } from './compatibility.js';
 import { ParsingErrorListener } from './compiler.js';
-import { StableHasher } from './equality.js';
+import { Equatable, StableHasher } from './equality.js';
 import { SourceResultSet } from './table.js';
 
 /**
  * An analyzed SQL expression tracking dependencies on non-static data (i.e. rows or connection sources).
  *
- * Consider the sync stream `SELECT * FROM issues WHERE is_public OR auth.param('is_admin')`. To be able to explicitly
+ * Consider the Sync Stream `SELECT * FROM issues WHERE is_public OR auth.param('is_admin')`. To be able to explicitly
  * track dependencies referenced in expressions, we transform them into a {@link SyncExpression}. For the `WHERE` clause
  * in that example, the {@link sqlExpression} would be `?1 OR (?2 ->> 'is_admin')`, where `?1` is a {@link ColumnInRow}
  * and `?2` is a {@link ConnectionParameter}.
@@ -20,7 +20,7 @@ import { SourceResultSet } from './table.js';
  * Once in this form, it's easy to reason about dependencies in expressions (used to later generate parameter match
  * clauses) and to evaluate expressions at runtime (by preparing them as a statement and binding external values).
  */
-export class SyncExpression implements EqualsIgnoringResultSet {
+export class SyncExpression implements EqualsIgnoringPrimaryResultSet {
   #sql?: string;
   #instantiation?: readonly ExpressionInput[];
 
@@ -63,17 +63,20 @@ export class SyncExpression implements EqualsIgnoringResultSet {
     readonly locations: NodeLocations
   ) {}
 
-  equalsAssumingSameResultSet(other: EqualsIgnoringResultSet): boolean {
+  equalsAssumingSamePrimaryResultSet(
+    other: EqualsIgnoringPrimaryResultSet,
+    tableValued: TableValuedFunctionEquality
+  ): boolean {
     return (
       other instanceof SyncExpression &&
       other.sql == this.sql &&
-      equalsIgnoringResultSetList.equals(other.instantiation, this.instantiation)
+      tableValued.listEquality.equals(other.instantiation, this.instantiation)
     );
   }
 
-  assumingSameResultSetEqualityHashCode(hasher: StableHasher): void {
+  assumingSamePrimaryResultSetEqualityHashCode(tableValued: TableValuedFunctionEquality, hasher: StableHasher): void {
     hasher.addString(this.sql);
-    equalsIgnoringResultSetList.hash(hasher, this.instantiation);
+    tableValued.listEquality.hash(hasher, this.instantiation);
   }
 }
 
@@ -89,36 +92,106 @@ class FindExternalData extends RecursiveExpressionVisitor<ExpressionInput, void,
   static readonly instance: FindExternalData = new FindExternalData();
 }
 
-export type ExpressionInput = ColumnInRow | ConnectionParameter;
+export type ExpressionInput = ColumnInRow | RowMetadata | ConnectionParameter;
 
-export class ColumnInRow implements EqualsIgnoringResultSet {
+/**
+ * An expression input resolved against a row of a result set: either a column value or metadata about the row's
+ * source table.
+ */
+export abstract class RowReference implements EqualsIgnoringPrimaryResultSet {
   constructor(
     readonly syntacticOrigin: Expr,
-    readonly resultSet: SourceResultSet,
-    readonly column: string
+    readonly resultSet: SourceResultSet
   ) {}
 
-  equalsAssumingSameResultSet(other: EqualsIgnoringResultSet): boolean {
-    return other instanceof ColumnInRow && other.column == this.column;
+  abstract equalsAssumingSamePrimaryResultSet(
+    other: EqualsIgnoringPrimaryResultSet,
+    tableValued: TableValuedFunctionEquality
+  ): boolean;
+  abstract assumingSamePrimaryResultSetEqualityHashCode(
+    tableValued: TableValuedFunctionEquality,
+    hasher: StableHasher
+  ): void;
+}
+
+export class ColumnInRow extends RowReference {
+  constructor(
+    syntacticOrigin: Expr,
+    resultSet: SourceResultSet,
+    readonly column: string
+  ) {
+    super(syntacticOrigin, resultSet);
   }
 
-  assumingSameResultSetEqualityHashCode(hasher: StableHasher): void {
+  override equalsAssumingSamePrimaryResultSet(
+    other: EqualsIgnoringPrimaryResultSet,
+    tableValued: TableValuedFunctionEquality
+  ): boolean {
+    return (
+      other instanceof ColumnInRow &&
+      other.column == this.column &&
+      tableValued.resultSetEquals(other.resultSet, this.resultSet)
+    );
+  }
+
+  override assumingSamePrimaryResultSetEqualityHashCode(
+    tableValued: TableValuedFunctionEquality,
+    hasher: StableHasher
+  ): void {
     hasher.addString(this.column);
+    tableValued.hashResultSet(hasher, this.resultSet);
   }
 }
 
-export class ConnectionParameter implements EqualsIgnoringResultSet {
+export type RowMetadataKind = 'schema' | 'table_name' | 'table_suffix';
+
+/**
+ * A reference to metadata of the row's source table (`users.schema()`, `users.table_name()` or
+ * `users.table_suffix()`) instead of an actual column, resolved against the concrete table a row was
+ * replicated from.
+ */
+export class RowMetadata extends RowReference {
+  constructor(
+    syntacticOrigin: Expr,
+    resultSet: SourceResultSet,
+    readonly kind: RowMetadataKind
+  ) {
+    super(syntacticOrigin, resultSet);
+  }
+
+  override equalsAssumingSamePrimaryResultSet(other: EqualsIgnoringPrimaryResultSet): boolean {
+    // Row metadata is always on the primary result set, so no need to hash the result set here.
+    return other instanceof RowMetadata && other.kind == this.kind;
+  }
+
+  override assumingSamePrimaryResultSetEqualityHashCode(
+    _tableValued: TableValuedFunctionEquality,
+    hasher: StableHasher
+  ): void {
+    hasher.addString(`table.${this.kind}`);
+  }
+}
+
+export class ConnectionParameter implements EqualsIgnoringPrimaryResultSet, Equatable {
   constructor(
     readonly syntacticOrigin: Expr,
     readonly source: ConnectionParameterSource
   ) {}
 
-  equalsAssumingSameResultSet(other: EqualsIgnoringResultSet): boolean {
+  equals(other: unknown): boolean {
     return other instanceof ConnectionParameter && other.source == this.source;
   }
 
-  assumingSameResultSetEqualityHashCode(hasher: StableHasher): void {
+  buildHash(hasher: StableHasher): void {
     hasher.addString(this.source);
+  }
+
+  equalsAssumingSamePrimaryResultSet(other: EqualsIgnoringPrimaryResultSet): boolean {
+    return this.equals(other);
+  }
+
+  assumingSamePrimaryResultSetEqualityHashCode(_tableValued: TableValuedFunctionEquality, hasher: StableHasher): void {
+    return this.buildHash(hasher);
   }
 }
 
@@ -126,7 +199,7 @@ export class ConnectionParameter implements EqualsIgnoringResultSet {
  * Tracks the original source location for translated {@link SqlExpression} nodes.
  *
  * We want to serialize translated expressions for sync plan, so embedding source offsets in them expands the size of
- * sync plans and is tedious. We only need access to node locations while compiling sync streams, which we store in this
+ * sync plans and is tedious. We only need access to node locations while compiling Sync Streams, which we store in this
  * in-memory map.
  */
 export class NodeLocations {
@@ -148,7 +221,7 @@ export interface SourceLocation {
   /**
    * An error reporter that can understand the given {@link location}.
    *
-   * Because sync streams might be composed of multiple source statements (like common table expressions) that can
+   * Because Sync Streams might be composed of multiple source statements (like common table expressions) that can
    * ultimately only be fully analyzed together, this is necessary to ensure we can report errors on the correct source
    * everywhere.
    */

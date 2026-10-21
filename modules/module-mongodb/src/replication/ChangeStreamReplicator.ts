@@ -2,25 +2,34 @@ import { replication, storage } from '@powersync/service-core';
 import { MongoModule } from '../module/MongoModule.js';
 import { ChangeStreamReplicationJob } from './ChangeStreamReplicationJob.js';
 import { ConnectionManagerFactory } from './ConnectionManagerFactory.js';
+import { MongoReplicationQueryProviderFactory } from './MongoReplicationQueryProvider.js';
 
 export interface ChangeStreamReplicatorOptions extends replication.AbstractReplicatorOptions {
   connectionFactory: ConnectionManagerFactory;
+  createReplicationQueryProvider?: MongoReplicationQueryProviderFactory;
 }
 
 export class ChangeStreamReplicator extends replication.AbstractReplicator<ChangeStreamReplicationJob> {
   private readonly connectionFactory: ConnectionManagerFactory;
+  private readonly createReplicationQueryProvider: MongoReplicationQueryProviderFactory | undefined;
 
   constructor(options: ChangeStreamReplicatorOptions) {
     super(options);
     this.connectionFactory = options.connectionFactory;
+    this.createReplicationQueryProvider = options.createReplicationQueryProvider;
+  }
+
+  protected get defaultSchema(): string {
+    return this.connectionFactory.dbConnectionConfig.database;
   }
 
   createJob(options: replication.CreateJobOptions): ChangeStreamReplicationJob {
     return new ChangeStreamReplicationJob({
-      id: this.createJobId(options.storage.group_id),
+      id: this.createJobId(options.storage.replicationStreamId),
       storage: options.storage,
       metrics: this.metrics,
       connectionFactory: this.connectionFactory,
+      createReplicationQueryProvider: this.createReplicationQueryProvider,
       lock: options.lock,
       rateLimiter: this.rateLimiter
     });

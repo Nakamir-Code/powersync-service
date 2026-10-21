@@ -2,17 +2,11 @@ import { PostgresRouteAPIAdapter } from '@module/api/PostgresRouteAPIAdapter.js'
 import * as types from '@module/types/types.js';
 import * as lib_postgres from '@powersync/lib-service-postgres';
 import { logger } from '@powersync/lib-services-framework';
-import {
-  BucketStorageFactory,
-  InternalOpId,
-  SUPPORTED_STORAGE_VERSIONS,
-  TestStorageConfig,
-  TestStorageFactory
-} from '@powersync/service-core';
+import { BucketStorageFactory, ReplicationCheckpoint, TestStorageFactory } from '@powersync/service-core';
+import { describeStorageCombinations, StorageCombinationTestOptions } from '@powersync/service-core-tests';
 import * as pgwire from '@powersync/service-jpgwire';
 import * as mongo_storage from '@powersync/service-module-mongodb-storage';
 import * as postgres_storage from '@powersync/service-module-postgres-storage';
-import { describe, TestOptions } from 'vitest';
 import { env } from './env.js';
 
 export const TEST_URI = env.PG_TEST_URL;
@@ -26,7 +20,12 @@ export const INITIALIZED_POSTGRES_STORAGE_FACTORY = postgres_storage.test_utils.
   url: env.PG_STORAGE_TEST_URL
 });
 
-const TEST_STORAGE_VERSIONS = SUPPORTED_STORAGE_VERSIONS;
+/**
+ * For tests that need a storage factory, but do not depend on the storage implementation.
+ */
+export const INITIALIZED_STORAGE_FACTORY = env.TEST_MONGO_STORAGE
+  ? INITIALIZED_MONGO_STORAGE_FACTORY
+  : INITIALIZED_POSTGRES_STORAGE_FACTORY;
 
 export interface StorageVersionTestContext {
   factory: TestStorageFactory;
@@ -34,30 +33,17 @@ export interface StorageVersionTestContext {
 }
 
 export function describeWithStorage(
-  options: TestOptions & { storageVersions?: number[] },
+  options: StorageCombinationTestOptions,
   fn: (context: StorageVersionTestContext) => void
 ) {
-  const storageVersions = options.storageVersions ?? TEST_STORAGE_VERSIONS;
-  const describeFactory = (storageName: string, config: TestStorageConfig) => {
-    describe(`${storageName} storage`, options, function () {
-      for (const storageVersion of storageVersions) {
-        describe(`storage v${storageVersion}`, function () {
-          fn({
-            factory: config.factory,
-            storageVersion
-          });
-        });
-      }
-    });
-  };
-
-  if (env.TEST_MONGO_STORAGE) {
-    describeFactory('mongodb', INITIALIZED_MONGO_STORAGE_FACTORY);
-  }
-
-  if (env.TEST_POSTGRES_STORAGE) {
-    describeFactory('postgres', INITIALIZED_POSTGRES_STORAGE_FACTORY);
-  }
+  describeStorageCombinations(
+    {
+      mongodb: env.TEST_MONGO_STORAGE ? INITIALIZED_MONGO_STORAGE_FACTORY : undefined,
+      postgres: env.TEST_POSTGRES_STORAGE ? INITIALIZED_POSTGRES_STORAGE_FACTORY : undefined
+    },
+    options,
+    fn
+  );
 }
 
 export const TEST_CONNECTION_OPTIONS = types.normalizeConnectionConfig({
@@ -121,11 +107,11 @@ export async function getClientCheckpoint(
   db: pgwire.PgClient,
   storageFactory: BucketStorageFactory,
   options?: { timeout?: number }
-): Promise<InternalOpId> {
+): Promise<ReplicationCheckpoint> {
   const start = Date.now();
 
   const api = new PostgresRouteAPIAdapter(db);
-  const lsn = await api.createReplicationHead(async (lsn) => lsn);
+  const lsn = await api.createReplicationHead(async (head) => ({ response: head, shouldAdvance: true }));
 
   // This old API needs a persisted checkpoint id.
   // Since we don't use LSNs anymore, the only way to get that is to wait.
@@ -134,12 +120,12 @@ export async function getClientCheckpoint(
 
   logger.info(`Waiting for LSN checkpoint: ${lsn}`);
   while (Date.now() - start < timeout) {
-    const storage = await storageFactory.getActiveStorage();
+    const storage = (await storageFactory.getActiveSyncConfig())?.storage;
     const cp = await storage?.getCheckpoint();
 
     if (cp?.lsn != null && cp.lsn >= lsn) {
       logger.info(`Got write checkpoint: ${lsn} : ${cp.checkpoint}`);
-      return cp.checkpoint;
+      return cp;
     }
 
     await new Promise((resolve) => setTimeout(resolve, 5));

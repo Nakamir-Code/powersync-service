@@ -1,3 +1,5 @@
+import { JsonValue } from '@powersync/service-core';
+import { orNull } from '@powersync/service-types';
 import * as t from 'ts-codec';
 import { bigint, hexBuffer, jsonb, jsonb_raw, pgwire_number } from '../codecs.js';
 
@@ -14,21 +16,25 @@ export const ColumnDescriptor = t.object({
   /**
    *  Some data sources have a type id that can be used to identify the type of the column
    */
-  typeId: t.number.optional()
+  type_oid: t.number.optional()
 });
 
 export const SourceTable = t.object({
   id: t.string,
   group_id: pgwire_number,
   connection_id: bigint,
-  relation_id: t.Null.or(jsonb_raw<StoredRelationId>()),
+  relation_id: orNull(jsonb_raw<StoredRelationId>()),
   schema_name: t.string,
   table_name: t.string,
-  replica_id_columns: t.Null.or(jsonb(t.array(ColumnDescriptor))),
+  replica_id_columns: orNull(jsonb(t.array(ColumnDescriptor))),
   snapshot_done: t.boolean,
-  snapshot_total_estimated_count: t.Null.or(bigint),
-  snapshot_replicated_count: t.Null.or(bigint),
-  snapshot_last_key: t.Null.or(hexBuffer)
+  snapshot_total_estimated_count: orNull(bigint),
+  snapshot_replicated_count: orNull(bigint),
+  snapshot_last_key: orNull(hexBuffer),
+  /**
+   * Source-specific metadata. Null for legacy records.
+   */
+  source_metadata: orNull(jsonb_raw<JsonValue>())
 });
 
 export type SourceTable = t.Encoded<typeof SourceTable>;

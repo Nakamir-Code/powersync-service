@@ -1,5 +1,6 @@
 import { JsonContainer } from '@powersync/service-jsonbig';
 import { BucketPriority, SqliteJsonRow } from '@powersync/service-sync-rules';
+import { orNull } from '@powersync/service-types';
 import * as t from 'ts-codec';
 
 export const BucketRequest = t.object({
@@ -18,20 +19,20 @@ export type BucketRequest = t.Decoded<typeof BucketRequest>;
  */
 export const RequestedStreamSubscription = t.object({
   /**
-   * The defined name of the stream as it appears in sync stream definitions.
+   * The defined name of the stream as it appears in Sync Stream definitions.
    */
   stream: t.string,
   /**
    * An optional dictionary of parameters to pass to this specific stream.
    */
-  parameters: t.union(t.record(t.any), t.Null),
+  parameters: orNull(t.record(t.any)),
   /**
    * Set when the client wishes to re-assign a different priority to this stream.
    *
-   * Streams and sync rules can also assign a default priority, but clients are allowed to override those. This can be
+   * Sync Streams and legacy bucket definitions can also assign a default priority, but clients are allowed to override those. This can be
    * useful when the priority for partial syncs depends on e.g. the current page opened in a client.
    */
-  override_priority: t.union(t.number, t.Null)
+  override_priority: orNull(t.number)
 });
 
 export type RequestedStreamSubscription = t.Decoded<typeof RequestedStreamSubscription>;
@@ -48,7 +49,7 @@ export const StreamSubscriptionRequest = t.object({
   include_defaults: t.boolean.optional(),
 
   /**
-   * An array of sync streams the client has opened explicitly.
+   * An array of Sync Streams the client has opened explicitly.
    */
   subscriptions: t.array(RequestedStreamSubscription)
 });
@@ -252,8 +253,8 @@ export interface BucketChecksum {
 /**
  * The reason a particular bucket is included in a checkpoint.
  *
- * This information allows clients to associate individual buckets with sync streams they're subscribed to. Having that
- * association is useful because it enables clients to track progress for individual sync streams.
+ * This information allows clients to associate individual buckets with Sync Streams they're subscribed to. Having that
+ * association is useful because it enables clients to track progress for individual Sync Streams.
  */
 export type BucketSubscriptionReason = BucketDerivedFromDefaultStream | BucketDerivedFromExplicitSubscription;
 

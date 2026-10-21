@@ -2,7 +2,8 @@ import { setTimeout } from 'node:timers/promises';
 import { describe, expect, test } from 'vitest';
 
 import { mongo } from '@powersync/lib-service-mongodb';
-import { ChangeStreamTestContext, setSnapshotHistorySeconds } from './change_stream_utils.js';
+import { openChangeStreamTestContext, setSnapshotHistorySeconds } from './change_stream_test_setup.js';
+import { DATABASE_TYPE, DatabaseType } from './DatabaseType.js';
 import { env } from './env.js';
 import { describeWithStorage, StorageVersionTestContext } from './util.js';
 
@@ -11,11 +12,13 @@ describe.runIf(env.CI || env.SLOW_TESTS)('change stream slow tests', { timeout: 
 });
 
 function defineSlowTests({ factory, storageVersion }: StorageVersionTestContext) {
-  const openContext = (options?: Parameters<typeof ChangeStreamTestContext.open>[1]) => {
-    return ChangeStreamTestContext.open(factory, { ...options, storageVersion });
+  const openContext = (options?: Parameters<typeof openChangeStreamTestContext>[1]) => {
+    return openChangeStreamTestContext(factory, { ...options, storageVersion });
   };
 
-  test('replicating snapshot with lots of data', async () => {
+  // This test uses getParameter/setParameter for minSnapshotHistoryWindowInSeconds,
+  // which Azure DocumentDB does not support.
+  test.skipIf(DATABASE_TYPE == DatabaseType.DOCUMENTDB)('replicating snapshot with lots of data', async () => {
     await using context = await openContext();
     // Test with low minSnapshotHistoryWindowInSeconds, to trigger:
     // > Read timestamp .. is older than the oldest available timestamp.

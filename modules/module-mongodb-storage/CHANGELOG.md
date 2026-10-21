@@ -1,5 +1,250 @@
 # @powersync/service-module-mongodb-storage
 
+## 0.23.1
+
+### Patch Changes
+
+- 44ce423: Add `config.source_table_options` to edition 3 sync configs, including MongoDB pre-filtering expressions. Generate editor schemas with examples and report validation errors at their YAML source locations.
+
+  MongoDB replication pre-filtering is not supported in the Open Edition; unsupported configurations report `PSYNC_S1348`. For example:
+
+  ```yaml
+  config:
+    edition: 3
+    source_table_options:
+      orders:
+        mongodb_filter_expression:
+          $and:
+            - $eq: ['$$doc.active', true]
+            - $in: ['$$doc.status', ['pending', 'shipped']]
+  streams:
+    orders:
+      query: SELECT * FROM orders
+  ```
+
+  Validation and deployment reject filters when the feature is unavailable. Parsing accepts an optional map of connection tags to connection types, rejecting MongoDB pre-filtering expressions on known non-MongoDB sources. Unknown connections or missing connection metadata produce advisory warnings. The service supplies connection metadata during validation, deployment, and filesystem loading. Filesystem-loaded sync configs also run source-capability checks. With `exit_on_error` disabled, configs remain available to diagnostics. Changing source-table options requires replacement processing when deploying a new sync config.
+
+  Source capability validation returns structured `ValidationDiagnostic` entries, allowing multiple fatal issues and
+  advisory warnings. Deployment and reprocessing reject fatal diagnostics while validation continues collecting
+  independent findings. Existing `ReplicationError` consumers retain the same diagnostic shape.
+
+- 4df5d45: Fix memory bloat with V4 storage compacting.
+- Updated dependencies [44ce423]
+- Updated dependencies [51a1a89]
+- Updated dependencies [e703ca5]
+- Updated dependencies [324093e]
+- Updated dependencies [286b0f8]
+- Updated dependencies [51a1a89]
+- Updated dependencies [57ef2f4]
+- Updated dependencies [6700c71]
+  - @powersync/service-sync-rules@0.44.0
+  - @powersync/service-core@1.27.1
+  - @powersync/service-types@0.20.0
+  - @powersync/lib-services-framework@0.10.4
+  - @powersync/lib-service-mongodb@0.6.34
+
+## 0.23.0
+
+### Minor Changes
+
+- 5078032: Change the default MongoDB storage version from 2 to 4.
+
+### Patch Changes
+
+- 424bbc0: Skip chunk-merge compact for small buckets after initial replication.
+- b70f467: Remove global replication lock for MongoDB storage.
+- Updated dependencies [0483d4e]
+- Updated dependencies [28f024b]
+- Updated dependencies [5078032]
+- Updated dependencies [424bbc0]
+- Updated dependencies [e87703a]
+- Updated dependencies [b70f467]
+- Updated dependencies [18f0c95]
+- Updated dependencies [c60db6e]
+- Updated dependencies [0483d4e]
+- Updated dependencies [a8c3f15]
+  - @powersync/service-core@1.27.0
+  - @powersync/service-types@0.19.0
+  - @powersync/service-sync-rules@0.43.0
+  - @powersync/lib-services-framework@0.10.3
+  - @powersync/lib-service-mongodb@0.6.33
+
+## 0.22.0
+
+### Minor Changes
+
+- 8b711ea: Use MongoDB client-level bulkWrite where available.
+
+### Patch Changes
+
+- f842b4e: Concurrent storage version 4 chunk-merge compaction across buckets during. Configure the shared worker limit with `storage.chunk_compaction_concurrency` (default: 4 with object storage, otherwise 2). Full compactions remain sequential within each job.
+- dfabd21: Increase default concurrent S3 uploads to 64 and tweak http connection pools.
+- Updated dependencies [f842b4e]
+- Updated dependencies [5ae6f75]
+  - @powersync/service-core@1.26.1
+  - @powersync/service-sync-rules@0.42.0
+  - @powersync/lib-services-framework@0.10.2
+  - @powersync/lib-service-mongodb@0.6.32
+
+## 0.21.0
+
+### Minor Changes
+
+- 189bd9e: Add storage_version: 4 as a stable storage version.
+- 332d649: [MongoDB Storage] Support incremental parameter compacting jobs.
+- 33a3c23: Add optional version_label for sync configs.
+- fccdff2: Add object storage metrics, and storage metrics split by sync config.
+- 989d9e1: Scope MongoDB v3 custom write checkpoint records and reads to the stream-assigned event definition that created them. Custom checkpoint mode names the event whose id is resolved through the active sync config's persisted mapping, while event handlers copy the assigned id from replication event payloads when writing checkpoints. This keeps active and incrementally processing checkpoint events separate when their definitions change.
+- 646c0de: Track replication events as MongoDB storage v3 source-table memberships so unchanged event definitions retain their assigned ids while new or changed definitions are resnapshotted during incremental reprocessing.
+- 2407f71: Apply timeouts and abortSignal handling to all S3 operations. The broad timeouts can be configured using the new `storage.object_storage.defaults_mode` option, or the `AWS_DEFAULTS_MODE` environment variable. Upgrade S3 SDK to fix further timeout issues.
+- a997c88: Restructure MongoDB V3 bucket compacting.
+
+### Patch Changes
+
+- e11c54b: Add S3 timing info for sync checkpoints.
+- aecf844: Persist subkey instead of re-computing every time.
+- cc121b3: [MongoDB Storage V3] Force create new replication stream when the old one is invalidated, and fix other consistency issues with V3 replication stream updates.
+- 4e4063b: Optimize runtime type checks, closes https://github.com/powersync-ja/powersync-service/issues/771.
+- 4037e8f: Add storage.default_storage_version config option.
+- dd7a22f: Add the sync config version label to attributed storage metrics while excluding it from shared OTLP telemetry.
+- Updated dependencies [e11c54b]
+- Updated dependencies [4b6a23e]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [0077a8d]
+- Updated dependencies [332d649]
+- Updated dependencies [33a3c23]
+- Updated dependencies [fccdff2]
+- Updated dependencies [989d9e1]
+- Updated dependencies [646c0de]
+- Updated dependencies [cc121b3]
+- Updated dependencies [4e4063b]
+- Updated dependencies [2407f71]
+- Updated dependencies [10131ca]
+- Updated dependencies [4037e8f]
+- Updated dependencies [3972bac]
+- Updated dependencies [dd7a22f]
+- Updated dependencies [a997c88]
+  - @powersync/service-core@1.26.0
+  - @powersync/service-sync-rules@0.41.0
+  - @powersync/service-types@0.18.0
+  - @powersync/lib-services-framework@0.10.1
+  - @powersync/lib-service-mongodb@0.6.31
+
+## 0.20.0
+
+### Minor Changes
+
+- 798d739: Add source-owned `SourceTable` reconciliation.
+
+  `resolveTables()` now queries all overlapping persisted candidates and passes them to a
+  source-provided reconciler that returns compatible and incompatible tables, can return
+  modified compatible copies, and supplies values used for potential new records. Storage persists allowlisted
+  source metadata differences but never interprets them. MongoDB v1/v3 and PostgreSQL storage were
+  refactored to this candidate-first model (PostgreSQL gains a nullable `source_metadata` JSONB column
+  via migration).
+
+### Patch Changes
+
+- Updated dependencies [27b56cb]
+- Updated dependencies [798d739]
+  - @powersync/service-core@1.25.0
+
+## 0.19.0
+
+### Minor Changes
+
+- 2189250: Add `/sync/checkpoint-request` for client-supplied checkpoint request ids, previously called write checkpoint ids. The route returns the stored `checkpoint_request_id`, storage now treats managed request ids as monotonic per user/client, custom checkpoint request ids continue to use the existing `checkpoint` field for backwards compatibility, and `checkpoint_requested_at` metadata lets compact jobs remove expired request-derived checkpoint records.
+
+  This release includes storage migrations for the checkpoint request metadata. Self-hosters should run migrations as part of the upgrade.
+
+- 922f974: Add experimental support for storing bucket data chunks on S3.
+
+### Patch Changes
+
+- 37591e9: [MongoDB Storage] Use batched deletes for clearing data.
+- 63707af: Stability and performance fixes for MongoDB storage V3.
+- be14bfe: [MongoDB Storage V3] Tweak size estimates and chunking to use actual BSON sizes.
+- aab068b: [MongoDB Storage V3] Add has_clear_op field and simplify checksum queries.
+- b3cbc25: Update "Flushed X + Y + Z updates" log to include more detail
+- Updated dependencies [087b61e]
+- Updated dependencies [2189250]
+- Updated dependencies [922f974]
+- Updated dependencies [c4860c9]
+- Updated dependencies [37591e9]
+- Updated dependencies [483415d]
+- Updated dependencies [8daa300]
+- Updated dependencies [aab068b]
+- Updated dependencies [37591e9]
+- Updated dependencies [be42e25]
+- Updated dependencies [cb4c627]
+  - @powersync/service-core@1.24.0
+  - @powersync/lib-services-framework@0.10.0
+  - @powersync/service-types@0.17.0
+  - @powersync/lib-service-mongodb@0.6.30
+  - @powersync/service-sync-rules@0.40.0
+
+## 0.18.3
+
+### Patch Changes
+
+- ea31f64: Potential fix and improved stack trace for 'evicted' errors.
+- 1f854d3: Fix for occasional readConcern errors when using bulk_read_preference.
+- Updated dependencies [ea71bf3]
+- Updated dependencies [ea31f64]
+- Updated dependencies [edc6ed4]
+  - @powersync/service-sync-rules@0.39.0
+  - @powersync/service-core@1.23.3
+  - @powersync/lib-services-framework@0.9.8
+  - @powersync/lib-service-mongodb@0.6.29
+
+## 0.18.2
+
+### Patch Changes
+
+- e4f683d: [MongoDB Storage] Add experimental option to allow reading data from secondaries.
+- c2edf86: Add `api.parameters.bucket_count_cache_ttl_minutes` configuration option.
+- df9ab1e: Batch concurrent write checkpoint requests and increase request limits to improve throughput.
+- b9f6b6f: [MongoDB Storage] Optimize writes under high replication lag.
+- Updated dependencies [71d4a0a]
+- Updated dependencies [e4f683d]
+- Updated dependencies [71d4a0a]
+- Updated dependencies [a6ae678]
+- Updated dependencies [c2edf86]
+- Updated dependencies [df9ab1e]
+  - @powersync/service-core@1.23.2
+  - @powersync/lib-service-mongodb@0.6.28
+  - @powersync/service-sync-rules@0.38.1
+  - @powersync/service-types@0.16.1
+  - @powersync/lib-services-framework@0.9.7
+
+## 0.18.1
+
+### Patch Changes
+
+- 7e65360: Restructure replication locks for updated sync config.
+- Updated dependencies [7e65360]
+  - @powersync/service-core@1.23.1
+
+## 0.18.0
+
+### Minor Changes
+
+- a91a08f: [Experimental] Enable incremental reprocessing for MongoDB source + MongoDB storage. This includes significant changes to the v3 storage format.
+
+### Patch Changes
+
+- 101ea67: Include table names in "Cannot mark snapshot done while source tables still require snapshotting" error.
+- Updated dependencies [a91a08f]
+- Updated dependencies [184c39f]
+- Updated dependencies [c3f75df]
+- Updated dependencies [4bd35ea]
+  - @powersync/service-core@1.23.0
+  - @powersync/service-types@0.16.0
+  - @powersync/service-sync-rules@0.38.0
+  - @powersync/lib-services-framework@0.9.6
+  - @powersync/lib-service-mongodb@0.6.27
+
 ## 0.17.0
 
 ### Minor Changes

@@ -1,4 +1,3 @@
-import { DataSourceConfig } from '@powersync/service-types/dist/config/PowerSyncConfig.js';
 import * as t from 'ts-codec';
 
 import { schema } from '@powersync/lib-services-framework';
@@ -18,7 +17,7 @@ export interface ConnectionTestResult {
 /**
  *  Provides a common interface for testing the connection to a DataSource.
  */
-export interface ConnectionTester<TConfig extends DataSourceConfig> {
+export interface ConnectionTester<TConfig extends types.configFile.DataSourceConfig> {
   /**
    *  Confirm if a connection can be established to the datasource for the provided datasource configuration
    *  @param config
@@ -35,7 +34,7 @@ export interface ReplicationModuleOptions extends modules.AbstractModuleOptions 
  *  A replication module describes all the functionality that PowerSync requires to
  *  replicate data from a DataSource. Whenever a new data source is added to powersync this class should be extended.
  */
-export abstract class ReplicationModule<TConfig extends DataSourceConfig>
+export abstract class ReplicationModule<TConfig extends types.configFile.DataSourceConfig>
   extends modules.AbstractModule
   implements ConnectionTester<TConfig>
 {
@@ -64,14 +63,6 @@ export abstract class ReplicationModule<TConfig extends DataSourceConfig>
    */
   protected abstract createReplicator(context: system.ServiceContext): AbstractReplicator;
 
-  /**
-   *  Any additional initialization specific to the module should be added here. Will be called if necessary after the
-   *  main initialization has been completed
-   *  @param context
-   *  @protected
-   */
-  protected abstract onInitialized(context: system.ServiceContext): Promise<void>;
-
   public abstract testConnection(config: TConfig): Promise<ConnectionTestResult>;
 
   /**
@@ -99,10 +90,18 @@ export abstract class ReplicationModule<TConfig extends DataSourceConfig>
     // If decoding fails, this will raise a hard error, and stop the service.
     this.decodeConfig(baseMatchingConfig);
 
-    context.replicationEngine?.register(this.createReplicator(context));
-    context.routerEngine?.registerAPI(this.createRouteAPIAdapter());
-
-    await this.onInitialized(context);
+    const sourceAPI = this.createRouteAPIAdapter();
+    // The router exists even in replication-only mode and owns adapter shutdown through the service lifecycle.
+    context.routerEngine.registerAPI(sourceAPI);
+    if (context.replicationEngine) {
+      const replicator = this.createReplicator(context);
+      if (sourceAPI.validateSourceCapabilities != null) {
+        // KLUDGE: Reuse the adapter validation for filesystem-loaded configs.
+        // A shared validation interface could replace this registration through the route adapter in the future.
+        replicator.registerSourceCapabilitiesAssertion((config) => api.assertSourceCapabilities(sourceAPI, config));
+      }
+      context.replicationEngine.register(replicator);
+    }
   }
 
   protected decodeConfig(config: TConfig): void {

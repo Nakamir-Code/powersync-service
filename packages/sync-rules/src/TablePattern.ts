@@ -18,13 +18,17 @@ export class ImplicitSchemaTablePattern implements Equatable {
 
   constructor(
     schema: string | null,
-    public readonly tablePattern: string
+    public readonly tablePattern: string,
+    connectionTag?: string | null
   ) {
-    if (schema) {
+    if (connectionTag != null) {
+      // A connection tag identifies a database on that connection, so a schema must be provided with it.
+      if (schema == null) throw new Error('A schema is required when a connection tag is set.');
+      this.connectionTag = connectionTag;
+      this.schema = schema;
+    } else if (schema) {
       const splitSchema = schema.split('.');
-      if (splitSchema.length > 2) {
-        throw new Error(`Invalid schema: ${schema}`);
-      }
+      if (splitSchema.length > 2) throw new Error(`Invalid schema: ${schema}`);
       if (splitSchema.length == 2) {
         this.connectionTag = splitSchema[0];
         this.schema = splitSchema[1];
@@ -42,6 +46,10 @@ export class ImplicitSchemaTablePattern implements Equatable {
     return this.tablePattern.endsWith('%');
   }
 
+  get isSchemaWildcard() {
+    return this.schema?.endsWith('%') ?? false;
+  }
+
   get name() {
     if (this.isWildcard) {
       throw new Error('Cannot get name for wildcard table');
@@ -50,7 +58,15 @@ export class ImplicitSchemaTablePattern implements Equatable {
   }
 
   toTablePattern(defaultSchema: string): TablePattern {
-    return new TablePattern(this.schema ?? defaultSchema, this.tablePattern);
+    // Preserve existing hydration behavior: explicit connection tags are stored but resolve to the default tag.
+    // FIXME: When multiple connections are supported, honor explicit tags consistently across SQL, source-table options,
+    // and hydration while preserving the interpretation of existing saved plans.
+    // Pass a tag for explicit schemas so quoted dots stay literal; undefined lets runtime defaults retain qualification.
+    return new TablePattern(
+      this.schema ?? defaultSchema,
+      this.tablePattern,
+      this.schema == null ? undefined : DEFAULT_TAG
+    );
   }
 
   buildHash(hasher: StableHasher): void {
@@ -81,8 +97,8 @@ export class TablePattern extends ImplicitSchemaTablePattern {
   declare public readonly connectionTag: string;
   declare public readonly schema: string;
 
-  constructor(schema: string, tablePattern: string) {
-    super(schema, tablePattern);
+  constructor(schema: string, tablePattern: string, connectionTag?: string) {
+    super(schema, tablePattern, connectionTag);
   }
 
   /**
@@ -101,8 +117,22 @@ export class TablePattern extends ImplicitSchemaTablePattern {
     return this.tablePattern.substring(0, this.tablePattern.length - 1);
   }
 
+  get schemaPrefix() {
+    if (!this.isSchemaWildcard) {
+      throw new Error('Not a wildcard schema');
+    }
+    return this.schema.substring(0, this.schema.length - 1);
+  }
+
   matches(table: SourceTableRef) {
-    if (this.connectionTag != table.connectionTag || this.schema != table.schema) {
+    if (this.connectionTag != table.connectionTag) {
+      return false;
+    }
+    if (this.isSchemaWildcard) {
+      if (!table.schema.startsWith(this.schemaPrefix)) {
+        return false;
+      }
+    } else if (this.schema != table.schema) {
       return false;
     }
     if (this.isWildcard) {

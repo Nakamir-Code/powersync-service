@@ -1,5 +1,219 @@
 # @powersync/service-core
 
+## 1.27.1
+
+### Patch Changes
+
+- 44ce423: Add `config.source_table_options` to edition 3 sync configs, including MongoDB pre-filtering expressions. Generate editor schemas with examples and report validation errors at their YAML source locations.
+
+  MongoDB replication pre-filtering is not supported in the Open Edition; unsupported configurations report `PSYNC_S1348`. For example:
+
+  ```yaml
+  config:
+    edition: 3
+    source_table_options:
+      orders:
+        mongodb_filter_expression:
+          $and:
+            - $eq: ['$$doc.active', true]
+            - $in: ['$$doc.status', ['pending', 'shipped']]
+  streams:
+    orders:
+      query: SELECT * FROM orders
+  ```
+
+  Validation and deployment reject filters when the feature is unavailable. Parsing accepts an optional map of connection tags to connection types, rejecting MongoDB pre-filtering expressions on known non-MongoDB sources. Unknown connections or missing connection metadata produce advisory warnings. The service supplies connection metadata during validation, deployment, and filesystem loading. Filesystem-loaded sync configs also run source-capability checks. With `exit_on_error` disabled, configs remain available to diagnostics. Changing source-table options requires replacement processing when deploying a new sync config.
+
+  Source capability validation returns structured `ValidationDiagnostic` entries, allowing multiple fatal issues and
+  advisory warnings. Deployment and reprocessing reject fatal diagnostics while validation continues collecting
+  independent findings. Existing `ReplicationError` consumers retain the same diagnostic shape.
+
+- 51a1a89: Add `service.version` and `sync_config_source` to diagnostics endpoint.
+- 286b0f8: Update WebSocket and HTTP dependencies to address reported security vulnerabilities. Update the OpenTelemetry metrics exporters to remove the protobufjs dependency and include metrics security fixes.
+- 57ef2f4: Report a non-fatal deprecation warning when a sync config uses legacy Sync Rules (`bucket_definitions:`). It appears in the `/api/admin/v1/diagnostics` and `/api/admin/v1/validate` responses with `level: 'warning'`, and the service now logs sync config errors and warnings when it loads or deploys a sync config.
+- Updated dependencies [44ce423]
+- Updated dependencies [e703ca5]
+- Updated dependencies [324093e]
+- Updated dependencies [286b0f8]
+- Updated dependencies [51a1a89]
+- Updated dependencies [57ef2f4]
+- Updated dependencies [6700c71]
+  - @powersync/service-sync-rules@0.44.0
+  - @powersync/service-types@0.20.0
+  - @powersync/lib-services-framework@0.10.4
+  - @powersync/service-rsocket-router@0.2.29
+
+## 1.27.0
+
+### Minor Changes
+
+- 5078032: Change the default MongoDB storage version from 2 to 4.
+- b70f467: Remove global replication lock for MongoDB storage.
+
+### Patch Changes
+
+- 0483d4e: Merge overlapping static and dynamic bucket selections in service-core, preserving subscription metadata and priority for all storage backends. This prevents duplicate bucket operations and client checksum failures with Postgres storage.
+- 28f024b: Fix errors during websocket parameter logging.
+- 424bbc0: Skip chunk-merge compact for small buckets after initial replication.
+- c60db6e: Mark legacy Sync Rules and the alpha Sync Streams implementation as `@deprecated`, and update the sync-rules README, templates, and examples to document Sync Streams first. Capitalize "Sync Streams" in log and error messages.
+- a8c3f15: Fix loading storage migrations on Windows: migration scripts are now imported via file URLs, since the Node.js ESM loader rejects absolute Windows paths such as `C:\...`.
+- Updated dependencies [5078032]
+- Updated dependencies [e87703a]
+- Updated dependencies [18f0c95]
+- Updated dependencies [c60db6e]
+- Updated dependencies [0483d4e]
+  - @powersync/service-types@0.19.0
+  - @powersync/service-sync-rules@0.43.0
+  - @powersync/lib-services-framework@0.10.3
+  - @powersync/service-rsocket-router@0.2.28
+
+## 1.26.1
+
+### Patch Changes
+
+- f842b4e: Concurrent storage version 4 chunk-merge compaction across buckets during. Configure the shared worker limit with `storage.chunk_compaction_concurrency` (default: 4 with object storage, otherwise 2). Full compactions remain sequential within each job.
+- Updated dependencies [5ae6f75]
+  - @powersync/service-sync-rules@0.42.0
+  - @powersync/lib-services-framework@0.10.2
+  - @powersync/service-rsocket-router@0.2.27
+
+## 1.26.0
+
+### Minor Changes
+
+- 189bd9e: Add storage_version: 4 as a stable storage version.
+- bb08068: Compile event payload queries into serialized sync plans and evaluate them through the shared row-projection implementation. Existing event deployments use one basic, direct-projection query per physical table; filters and other advanced SQL forms are not currently documented or recommended.
+
+  Edition 3 now validates and applies event `WHERE` clauses. Existing persisted plans and editions 1 and 2 retain the legacy behavior of ignoring filters and emit a warning; deploy a new sync config to enable compiled filtering. Remove event `WHERE` clauses before rolling the service back to an older version.
+
+  Event evaluation now follows sync stream semantics by returning all payloads from matching queries, including overlapping exact and wildcard sources, or no payloads when filters do not match. Payload query order does not affect persisted equality. Compiled `SELECT *` payloads also include underscore-prefixed columns, matching sync streams.
+
+- 332d649: [MongoDB Storage] Support incremental parameter compacting jobs.
+- 33a3c23: Add optional version_label for sync configs.
+- fccdff2: Add object storage metrics, and storage metrics split by sync config.
+- 989d9e1: Scope MongoDB v3 custom write checkpoint records and reads to the stream-assigned event definition that created them. Custom checkpoint mode names the event whose id is resolved through the active sync config's persisted mapping, while event handlers copy the assigned id from replication event payloads when writing checkpoints. This keeps active and incrementally processing checkpoint events separate when their definitions change.
+- 646c0de: Track replication events as MongoDB storage v3 source-table memberships so unchanged event definitions retain their assigned ids while new or changed definitions are resnapshotted during incremental reprocessing.
+- 2407f71: Apply timeouts and abortSignal handling to all S3 operations. The broad timeouts can be configured using the new `storage.object_storage.defaults_mode` option, or the `AWS_DEFAULTS_MODE` environment variable. Upgrade S3 SDK to fix further timeout issues.
+- a997c88: Restructure MongoDB V3 bucket compacting.
+
+### Patch Changes
+
+- e11c54b: Add S3 timing info for sync checkpoints.
+- 0077a8d: Fix connection stall after data fetch errors.
+- cc121b3: [MongoDB Storage V3] Force create new replication stream when the old one is invalidated, and fix other consistency issues with V3 replication stream updates.
+- 4e4063b: Optimize runtime type checks, closes https://github.com/powersync-ja/powersync-service/issues/771.
+- 10131ca: Log checkpoint_interrupted when a stream errors while fetching data.
+- 4037e8f: Add storage.default_storage_version config option.
+- dd7a22f: Add the sync config version label to attributed storage metrics while excluding it from shared OTLP telemetry.
+- Updated dependencies [4b6a23e]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [33a3c23]
+- Updated dependencies [fccdff2]
+- Updated dependencies [646c0de]
+- Updated dependencies [4e4063b]
+- Updated dependencies [4037e8f]
+- Updated dependencies [3972bac]
+  - @powersync/service-sync-rules@0.41.0
+  - @powersync/service-types@0.18.0
+  - @powersync/lib-services-framework@0.10.1
+  - @powersync/service-rsocket-router@0.2.26
+
+## 1.25.0
+
+### Minor Changes
+
+- 798d739: Add source-owned `SourceTable` reconciliation.
+
+  `resolveTables()` now queries all overlapping persisted candidates and passes them to a
+  source-provided reconciler that returns compatible and incompatible tables, can return
+  modified compatible copies, and supplies values used for potential new records. Storage persists allowlisted
+  source metadata differences but never interprets them. MongoDB v1/v3 and PostgreSQL storage were
+  refactored to this candidate-first model (PostgreSQL gains a nullable `source_metadata` JSONB column
+  via migration).
+
+### Patch Changes
+
+- 27b56cb: Optimization for generating subkey UUIDs.
+
+## 1.24.0
+
+### Minor Changes
+
+- 087b61e: Configurable heartbeat_interval_seconds for MongoDB, Postgres, SQL Server.
+- 2189250: Add `/sync/checkpoint-request` for client-supplied checkpoint request ids, previously called write checkpoint ids. The route returns the stored `checkpoint_request_id`, storage now treats managed request ids as monotonic per user/client, custom checkpoint request ids continue to use the existing `checkpoint` field for backwards compatibility, and `checkpoint_requested_at` metadata lets compact jobs remove expired request-derived checkpoint records.
+
+  This release includes storage migrations for the checkpoint request metadata. Self-hosters should run migrations as part of the upgrade.
+
+- 922f974: Add experimental support for storing bucket data chunks on S3.
+
+### Patch Changes
+
+- c4860c9: Improve Postgres sync throughput by reading bucket data with ordered, per-bucket index range scans that stop once the requested batch is full.
+- 483415d: Clarify whether too-many-buckets log breakdowns are grouped by sync stream or legacy bucket definition, and include up
+  to 100 entries.
+- aab068b: [MongoDB Storage V3] Add has_clear_op field and simplify checksum queries.
+- 37591e9: Lock replication slots before clearing data, preventing concurrent clearing.
+- Updated dependencies [2189250]
+- Updated dependencies [8daa300]
+- Updated dependencies [df5663b]
+- Updated dependencies [be42e25]
+- Updated dependencies [cb4c627]
+  - @powersync/lib-services-framework@0.10.0
+  - @powersync/service-types@0.17.0
+  - @powersync/service-sync-rules@0.40.0
+  - @powersync/service-rsocket-router@0.2.25
+
+## 1.23.3
+
+### Patch Changes
+
+- ea31f64: Potential fix and improved stack trace for 'evicted' errors.
+- Updated dependencies [ea71bf3]
+- Updated dependencies [edc6ed4]
+  - @powersync/service-sync-rules@0.39.0
+  - @powersync/lib-services-framework@0.9.8
+  - @powersync/service-rsocket-router@0.2.24
+
+## 1.23.2
+
+### Patch Changes
+
+- 71d4a0a: Add logs for checkpoint_complete to assist with debugging. Remove "sync lock" logs.
+- e4f683d: [MongoDB Storage] Add experimental option to allow reading data from secondaries.
+- 71d4a0a: Fix edge case where the service can return incomplete data. This could happen when using bucket priorities, and a checkpoint is invalidated by the compact process while syncing.
+- c2edf86: Add `api.parameters.bucket_count_cache_ttl_minutes` configuration option.
+- df9ab1e: Batch concurrent write checkpoint requests and increase request limits to improve throughput.
+- Updated dependencies [a6ae678]
+- Updated dependencies [c2edf86]
+  - @powersync/service-sync-rules@0.38.1
+  - @powersync/service-types@0.16.1
+  - @powersync/lib-services-framework@0.9.7
+  - @powersync/service-rsocket-router@0.2.23
+
+## 1.23.1
+
+### Patch Changes
+
+- 7e65360: Restructure replication locks for updated sync config.
+
+## 1.23.0
+
+### Minor Changes
+
+- a91a08f: [Experimental] Enable incremental reprocessing for MongoDB source + MongoDB storage. This includes significant changes to the v3 storage format.
+
+### Patch Changes
+
+- Updated dependencies [a91a08f]
+- Updated dependencies [184c39f]
+- Updated dependencies [c3f75df]
+- Updated dependencies [4bd35ea]
+  - @powersync/service-types@0.16.0
+  - @powersync/service-sync-rules@0.38.0
+  - @powersync/lib-services-framework@0.9.6
+  - @powersync/service-rsocket-router@0.2.22
+
 ## 1.22.0
 
 ### Minor Changes

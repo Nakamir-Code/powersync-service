@@ -1,6 +1,6 @@
 import { DiagnosticsOptions, getSyncRulesStatus } from '@/api/diagnostics.js';
 import { RouteAPI, SlotWalBudgetInfo } from '@/api/RouteAPI.js';
-import { BucketStorageFactory, PersistedSyncRules, storage } from '@/index.js';
+import { ParsedSyncConfigSet, storage } from '@/index.js';
 import { SqlSyncRules } from '@powersync/service-sync-rules';
 import { describe, expect, test } from 'vitest';
 
@@ -13,53 +13,59 @@ bucket_definitions:
       - SELECT id FROM test_table
 `;
 
-function makeSyncRulesContent(overrides?: { slot_name?: string }): storage.PersistedSyncRulesContent {
+function makeSyncRulesContent(overrides?: {
+  slot_name?: string;
+  version_label?: string;
+  status?: storage.PersistedSyncConfigStatus;
+}): storage.PersistedSyncConfigContent {
   // We don't implement the entire interface correctly here - just enough to test the diagnostics logic.
-  return {
-    id: 1,
-    slot_name: overrides?.slot_name ?? 'test_slot',
-    sync_rules_content: MINIMAL_SYNC_RULES,
-    compiled_plan: null,
-    active: true,
-    storageVersion: 1,
+  const status = overrides?.status ?? {
+    id: '1',
+    replicationStreamId: 1,
+    state: storage.SyncRuleState.ACTIVE,
     last_checkpoint_lsn: 'some_lsn',
     last_fatal_error: null,
     last_fatal_error_ts: null,
     last_keepalive_ts: new Date(),
-    last_checkpoint_ts: new Date(),
+    last_checkpoint_ts: new Date()
+  };
+
+  return {
+    replicationStreamId: 1,
+    syncConfigId: null,
+    replicationStreamName: overrides?.slot_name ?? 'test_slot',
+    sync_rules_content: MINIMAL_SYNC_RULES,
+    compiled_plan: null,
+    storageVersion: 1,
+    syncConfigState: status.state,
+    version_label: overrides?.version_label,
     parsed(options?: any) {
       const syncRules = SqlSyncRules.fromYaml(MINIMAL_SYNC_RULES, {
         ...options,
         defaultSchema: 'public'
       });
       return {
-        syncConfigWithErrors: syncRules
-      } as PersistedSyncRules;
+        syncConfigs: [syncRules]
+      } as ParsedSyncConfigSet;
     },
-    lock() {
-      throw new Error('Not implemented in mock');
-    },
-    current_lock: null,
     logger: null as any,
     asUpdateOptions: null as any,
-    getStorageConfig: null as any
-  } as storage.PersistedSyncRulesContent;
+    getStorageConfig: null as any,
+    async getSyncConfigStatus() {
+      return status;
+    }
+  } as storage.PersistedSyncConfigContent;
 }
 
-function makeBucketStorage() {
+function makeSystemStorage() {
   return {
-    getInstance() {
+    async getStatus() {
       return {
-        async getStatus() {
-          return {
-            snapshot_done: true,
-            checkpoint_lsn: 'some_lsn',
-            active: true
-          };
-        }
+        snapshotDone: true,
+        resumeLsn: 'some_lsn'
       };
     }
-  } as unknown as BucketStorageFactory;
+  } as storage.SyncRulesBucketStorage;
 }
 
 function makeRouteAPI(walBudget?: SlotWalBudgetInfo | undefined): RouteAPI {
@@ -92,7 +98,8 @@ function makeRouteAPI(walBudget?: SlotWalBudgetInfo | undefined): RouteAPI {
 const OPTIONS: DiagnosticsOptions = {
   live_status: true,
   check_connection: true,
-  include_content: false
+  include_content: false,
+  active: true
 };
 
 describe('getSyncRulesStatus WAL budget warnings', () => {
@@ -102,7 +109,7 @@ describe('getSyncRulesStatus WAL budget warnings', () => {
       safe_wal_size: 4 * GB,
       max_slot_wal_keep_size: 10 * GB
     });
-    const result = await getSyncRulesStatus(makeBucketStorage(), api, makeSyncRulesContent(), OPTIONS);
+    const result = await getSyncRulesStatus(api, makeSyncRulesContent(), OPTIONS, makeSystemStorage());
     const walWarnings = result!.errors.filter((e) => e.message.includes('WAL budget'));
     expect(walWarnings).toHaveLength(1);
     expect(walWarnings[0].level).toBe('warning');
@@ -115,7 +122,7 @@ describe('getSyncRulesStatus WAL budget warnings', () => {
       safe_wal_size: 8 * GB,
       max_slot_wal_keep_size: 10 * GB
     });
-    const result = await getSyncRulesStatus(makeBucketStorage(), api, makeSyncRulesContent(), OPTIONS);
+    const result = await getSyncRulesStatus(api, makeSyncRulesContent(), OPTIONS, makeSystemStorage());
     const walWarnings = result!.errors.filter((e) => e.message.includes('WAL budget'));
     expect(walWarnings).toHaveLength(0);
   });
@@ -126,7 +133,7 @@ describe('getSyncRulesStatus WAL budget warnings', () => {
       safe_wal_size: -2.4 * GB,
       max_slot_wal_keep_size: 1 * 1024 * 1024 // 1MB
     });
-    const result = await getSyncRulesStatus(makeBucketStorage(), api, makeSyncRulesContent(), OPTIONS);
+    const result = await getSyncRulesStatus(api, makeSyncRulesContent(), OPTIONS, makeSystemStorage());
     const walWarnings = result!.errors.filter((e) => e.message.includes('WAL budget'));
     expect(walWarnings).toHaveLength(1);
     expect(walWarnings[0].message).toContain('0%');
@@ -137,7 +144,7 @@ describe('getSyncRulesStatus WAL budget warnings', () => {
     const api = makeRouteAPI({
       wal_status: 'lost'
     });
-    const result = await getSyncRulesStatus(makeBucketStorage(), api, makeSyncRulesContent(), OPTIONS);
+    const result = await getSyncRulesStatus(api, makeSyncRulesContent(), OPTIONS, makeSystemStorage());
     const walErrors = result!.errors.filter(
       (e) => e.message.includes('WAL budget') || e.message.includes('PSYNC_S1146')
     );
@@ -146,10 +153,184 @@ describe('getSyncRulesStatus WAL budget warnings', () => {
 
   test('no WAL error when getSlotWalBudget is not defined', async () => {
     const api = makeRouteAPI();
-    const result = await getSyncRulesStatus(makeBucketStorage(), api, makeSyncRulesContent(), OPTIONS);
+    const result = await getSyncRulesStatus(api, makeSyncRulesContent(), OPTIONS, makeSystemStorage());
     const walErrors = result!.errors.filter(
       (e) => e.message.includes('WAL budget') || e.message.includes('PSYNC_S1146')
     );
     expect(walErrors).toHaveLength(0);
+  });
+
+  test('uses sync config status for status-derived diagnostics fields', async () => {
+    const configStatus: storage.PersistedSyncConfigStatus = {
+      id: 'config-a',
+      replicationStreamId: 1,
+      state: storage.SyncRuleState.ACTIVE,
+      last_checkpoint_lsn: 'config_lsn',
+      last_fatal_error: 'config failed',
+      last_fatal_error_ts: new Date('2026-01-01T00:00:00.000Z'),
+      last_keepalive_ts: new Date('2026-01-01T00:01:00.000Z'),
+      last_checkpoint_ts: new Date('2026-01-01T00:02:00.000Z')
+    };
+    const result = await getSyncRulesStatus(
+      makeRouteAPI(),
+      makeSyncRulesContent({ status: configStatus }),
+      OPTIONS,
+      makeSystemStorage()
+    );
+
+    expect(result!.connections[0].last_checkpoint_ts).toBe('2026-01-01T00:02:00.000Z');
+    expect(result!.connections[0].last_keepalive_ts).toBe('2026-01-01T00:01:00.000Z');
+    expect(result!.errors.some((error) => error.message == 'config failed')).toBe(true);
+  });
+
+  test('includes the sync config version label', async () => {
+    const result = await getSyncRulesStatus(
+      makeRouteAPI(),
+      makeSyncRulesContent({ version_label: 'v6' }),
+      OPTIONS,
+      makeSystemStorage()
+    );
+
+    expect(result!.version_label).toBe('v6');
+  });
+
+  test('includes the sync config version label when parsing fails', async () => {
+    const content = makeSyncRulesContent({ version_label: 'v6' });
+    content.parsed = () => {
+      throw new Error('Invalid sync config');
+    };
+
+    const result = await getSyncRulesStatus(makeRouteAPI(), content, OPTIONS, makeSystemStorage());
+
+    expect(result!.version_label).toBe('v6');
+    expect(result!.errors).toEqual([expect.objectContaining({ level: 'fatal', message: 'Invalid sync config' })]);
+  });
+
+  test('reports each sync config error with its source location when parsing fails', async () => {
+    const yaml = `
+config:
+  edition: 3
+streams:
+  global:
+    query: SELECT id FROM test_table
+    unknown_key: true
+`;
+    const content = makeSyncRulesContent();
+    content.parsed = (options?: any) => {
+      SqlSyncRules.fromYaml(yaml, { ...options, defaultSchema: 'public', throwOnError: true });
+      throw new Error('Expected parsing to fail');
+    };
+
+    const result = await getSyncRulesStatus(makeRouteAPI(), content, OPTIONS, makeSystemStorage());
+
+    expect(result!.errors).toHaveLength(1);
+    const [error] = result!.errors;
+    expect(error.level).toBe('fatal');
+    expect(error.message).not.toContain('Expected parsing to fail');
+    expect(yaml.slice(error.location!.start_offset, error.location!.end_offset)).toBe('unknown_key');
+  });
+});
+
+describe('source capability validation', () => {
+  test('exposes stored replication errors when source checks cannot run', async () => {
+    const content = makeSyncRulesContent({
+      status: {
+        id: '1',
+        replicationStreamId: 1,
+        state: storage.SyncRuleState.PROCESSING,
+        last_checkpoint_lsn: null,
+        last_fatal_error: 'Source capability unavailable',
+        last_fatal_error_ts: new Date(),
+        last_keepalive_ts: null,
+        last_checkpoint_ts: null
+      }
+    });
+    const result = await getSyncRulesStatus(
+      makeRouteAPI(),
+      content,
+      {
+        ...OPTIONS,
+        check_connection: false,
+        active: false,
+        include_content: true
+      },
+      makeSystemStorage()
+    );
+    expect(result?.content).toBe(MINIMAL_SYNC_RULES);
+    expect(result?.errors).toContainEqual(
+      expect.objectContaining({
+        level: 'fatal',
+        message: 'Source capability unavailable'
+      })
+    );
+  });
+
+  test('reports capability failures alongside table diagnostics', async () => {
+    const api = makeRouteAPI();
+    api.validateSourceCapabilities = async () => [
+      { level: 'fatal', message: 'Source capability unavailable' },
+      { level: 'warning', message: 'Source advisory', location: { start_offset: 1, end_offset: 4 } }
+    ];
+    api.getDebugTablesInfo = async () => [
+      {
+        schema: 'public',
+        pattern: 'items',
+        wildcard: false,
+        table: {
+          schema: 'public',
+          name: 'items',
+          data_queries: true,
+          parameter_queries: false,
+          replication_id: [],
+          errors: [{ level: 'warning', message: 'Index missing' }]
+        }
+      }
+    ];
+    const result = await getSyncRulesStatus(api, makeSyncRulesContent(), OPTIONS, makeSystemStorage());
+    expect(result!.errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ level: 'fatal', message: 'Source capability unavailable' }),
+        expect.objectContaining({ level: 'warning', message: 'Index missing' }),
+        expect.objectContaining({
+          level: 'warning',
+          message: 'Source advisory',
+          location: { start_offset: 1, end_offset: 4 }
+        })
+      ])
+    );
+    expect(result!.connections[0].tables).toHaveLength(1);
+  });
+
+  test('preserves both validation failures and continues independent diagnostics', async () => {
+    const api = makeRouteAPI({
+      wal_status: 'extended',
+      safe_wal_size: 4 * GB,
+      max_slot_wal_keep_size: 10 * GB
+    });
+    api.validateSourceCapabilities = async () => {
+      throw new Error('Source capability unavailable');
+    };
+    api.getDebugTablesInfo = async () => {
+      throw new Error('Table metadata unavailable');
+    };
+    const result = await getSyncRulesStatus(api, makeSyncRulesContent(), OPTIONS, makeSystemStorage());
+    expect(result!.errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ level: 'fatal', message: 'Source capability unavailable' }),
+        expect.objectContaining({ level: 'fatal', message: 'Table metadata unavailable' }),
+        expect.objectContaining({ level: 'warning', message: expect.stringContaining('WAL budget') })
+      ])
+    );
+  });
+
+  test('does not check capabilities when connection checks are disabled', async () => {
+    const api = makeRouteAPI();
+    let called = false;
+    api.validateSourceCapabilities = async () => {
+      called = true;
+      return [];
+    };
+    await getSyncRulesStatus(api, makeSyncRulesContent(), { ...OPTIONS, check_connection: false }, makeSystemStorage());
+    expect(called).toBe(false);
   });
 });
