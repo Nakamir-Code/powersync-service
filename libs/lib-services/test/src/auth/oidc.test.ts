@@ -64,7 +64,9 @@ describe('fetchOidcToken', () => {
   });
 
   test('returns the access token and parsed lifetime', async () => {
-    fetchMock.mockResolvedValue(new Response(JSON.stringify({ access_token: 'abc', expires_in: 3600 }), { status: 200 }));
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ access_token: 'abc', expires_in: 3600 }), { status: 200 })
+    );
 
     const token = await fetchOidcToken('https://idp.example/token', undefined, {
       parseExpiry: makeExpiryParser({ field: 'expires_in' })
@@ -94,9 +96,9 @@ describe('fetchOidcToken', () => {
         })
     );
 
-    const request = expect(
-      fetchOidcToken('https://idp.example/token', undefined, { timeoutMs: 25 })
-    ).rejects.toThrow('timed out after 25ms');
+    const request = expect(fetchOidcToken('https://idp.example/token', undefined, { timeoutMs: 25 })).rejects.toThrow(
+      'timed out after 25ms'
+    );
 
     await vi.advanceTimersByTimeAsync(25);
     await request;
