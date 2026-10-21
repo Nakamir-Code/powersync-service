@@ -1,43 +1,60 @@
 import * as lib_mongo from '@powersync/lib-service-mongodb';
-import { ReplicationAssertionError } from '@powersync/lib-services-framework';
-import { ColumnDescriptor, storage } from '@powersync/service-core';
-import { HydratedSyncConfig, MatchingSources } from '@powersync/service-sync-rules';
+import { ReplicationAssertionError, ServiceAssertionError } from '@powersync/lib-services-framework';
+import { InternalOpId, storage } from '@powersync/service-core';
+import { EventDefinitionId } from '@powersync/service-sync-rules';
 import * as bson from 'bson';
 import { mongoTableId } from '../../../utils/util.js';
-import { calculateCheckpointState } from '../CheckpointState.js';
+import { canCheckpointState } from '../CheckpointState.js';
 import { MongoBucketBatch, MongoBucketBatchOptions } from '../MongoBucketBatch.js';
-import { syncRuleStateUpdatePipeline } from '../SyncRuleStateUpdate.js';
+import { MongoParsedSyncConfigSet } from '../MongoParsedSyncConfigSet.js';
+import { MongoWriteBatch } from '../MongoWriteBatch.js';
+import { stopReplicationStreamPipeline } from '../SyncRuleStateUpdate.js';
 import { PersistedBatch } from '../common/PersistedBatch.js';
 import { SourceRecordStore } from '../common/SourceRecordStore.js';
+import { SyncRuleDocumentBase } from '../models.js';
 import { PersistedBatchV3 } from './PersistedBatchV3.js';
 import { SourceRecordStoreV3 } from './SourceRecordStoreV3.js';
 import { VersionedPowerSyncMongoV3 } from './VersionedPowerSyncMongoV3.js';
-import { ReplicationStreamDocumentV3, SourceTableDocumentV3 } from './models.js';
-
-function sameStringArray(left: string[], right: string[]) {
-  return left.length == right.length && left.every((value, index) => value == right[index]);
-}
+import { CustomCheckpointRequestDocumentV3, ReplicationStreamDocumentV3, SourceTableDocumentV3 } from './models.js';
+import {
+  createNewSourceTable,
+  overlappingSourceTableFilter,
+  planSourceTableReconciliation,
+  sourceTableDesiredResolution,
+  sourceTableFromDocument,
+  SourceTableReconciliationContext
+} from './source-table-utils.js';
 
 export class MongoBucketBatchV3 extends MongoBucketBatch {
-  declare public readonly db: VersionedPowerSyncMongoV3;
+  declare readonly db: VersionedPowerSyncMongoV3;
 
   private readonly store: SourceRecordStore;
-  private readonly syncConfigId: bson.ObjectId;
+  /** Avoid repeating idempotent createIndexes calls for every checkpoint flush. */
+  private readonly initializedCustomCheckpointEventIds = new Set<EventDefinitionId>();
+  // Used only to validate supplied checkpoint ids; it does not initialize collections.
+  private readonly knownEventIds: ReadonlySet<EventDefinitionId>;
+  private readonly syncConfigIds: bson.ObjectId[];
   private needsActivationV3 = true;
   private lastWaitingLogThrottledV3 = 0;
 
   constructor(options: MongoBucketBatchOptions) {
     super(options);
-    if (options.syncConfigId == null) {
+    const syncConfigIds = options.syncConfigIds ?? [];
+    if (syncConfigIds.length == 0) {
       throw new ReplicationAssertionError('Missing sync config id for v3 batch');
     }
-    this.syncConfigId = options.syncConfigId;
-    this.store = new SourceRecordStoreV3(this.db, this.group_id, this.mapping);
+    this.syncConfigIds = syncConfigIds;
+    this.knownEventIds = new Set(this.mapping.allEventDefinitionIds());
+    this.store = new SourceRecordStoreV3(this.db, this.replicationStreamId, this.mapping);
   }
 
   protected createPersistedBatch(writtenSize: number): PersistedBatch {
-    return new PersistedBatchV3(this.db, this.group_id, this.mapping, writtenSize, {
-      logger: this.logger
+    return new PersistedBatchV3(this.db, this.replicationStreamId, this.mapping, writtenSize, {
+      logger: this.logger,
+      objectStorage: this.options.objectStorage,
+      inlineThresholdBytes: this.options.inlineThresholdBytes,
+      signal: this.options.signal,
+      objectStorageUsageWriterId: this.objectStorageUsageWriterId
     });
   }
 
@@ -45,13 +62,88 @@ export class MongoBucketBatchV3 extends MongoBucketBatch {
     return this.store;
   }
 
+  protected override persistedOpHead(stream: SyncRuleDocumentBase): InternalOpId {
+    return (stream as ReplicationStreamDocumentV3).last_persisted_op ?? 0n;
+  }
+
+  protected override onReplicationTransactionFlush(writes: MongoWriteBatch, lastOp: InternalOpId): void {
+    // Durably advance the stream-level head of persisted ops within the flush transaction.
+    // This ensures a checkpoint created later (even by an empty commit, or by a freshly-appended
+    // config that replicates nothing) covers all ops persisted before a potential crash.
+    writes.updateOne(
+      this.db.sync_rules,
+      {
+        _id: this.replicationStreamId
+      },
+      {
+        $max: {
+          last_persisted_op: lastOp
+        }
+      }
+    );
+  }
+
+  private selectedSyncConfigObjectIds(syncConfigIds: string[]): bson.ObjectId[] {
+    const selectedIds = new Set(this.syncConfigIds.map((id) => id.toHexString()));
+    return syncConfigIds
+      .filter((id) => selectedIds.has(id) && bson.ObjectId.isValid(id))
+      .map((id) => new bson.ObjectId(id));
+  }
+
+  private relevantSyncConfigIds(table: storage.SourceTable): bson.ObjectId[] {
+    const bucketDataSourceIds = table.bucketDataSources.map((source) => this.mapping.bucketSourceId(source));
+    const parameterLookupSourceIds = table.parameterLookupSources.map((source) =>
+      this.mapping.parameterLookupId(source)
+    );
+    return this.selectedSyncConfigObjectIds(
+      this.mapping.syncConfigIdsForSourceTable(
+        this.syncConfigIds.map((id) => id.toHexString()),
+        table.ref,
+        bucketDataSourceIds,
+        parameterLookupSourceIds,
+        [...table.eventDefinitionIds!]
+      )
+    );
+  }
+
+  private relevantSyncConfigIdsForTables(tables: storage.SourceTable[]): bson.ObjectId[] {
+    const ids = new Map<string, bson.ObjectId>();
+    for (const table of tables) {
+      for (const id of this.relevantSyncConfigIds(table)) {
+        ids.set(id.toHexString(), id);
+      }
+    }
+    return [...ids.values()];
+  }
+
+  private snapshotBlockingSourceTablesFilter(): Record<string, unknown> {
+    const clauses = this.syncConfigIds.flatMap((syncConfigId) => {
+      const filter = this.mapping.snapshotBlockingSourceTablesFilter(syncConfigId.toHexString()) as {
+        $or?: Record<string, unknown>[];
+      };
+      return filter.$or ?? [];
+    });
+
+    if (clauses.length == 0) {
+      return {
+        snapshot_done: false,
+        _id: { $exists: false }
+      };
+    }
+
+    return {
+      snapshot_done: false,
+      $or: clauses
+    };
+  }
+
   protected async cleanupDroppedSourceTables(sourceTables: storage.SourceTable[]) {
     for (const table of sourceTables) {
       await this.db
-        .sourceRecordsV3(this.group_id, mongoTableId(table.id))
+        .sourceRecords(this.replicationStreamId, mongoTableId(table.id))
         .drop()
         .catch((error) => {
-          if (lib_mongo.isMongoServerError(error) && error.codeName === 'NamespaceNotFound') {
+          if (lib_mongo.isMongoNamespaceNotFoundError(error)) {
             return;
           }
           throw error;
@@ -60,347 +152,283 @@ export class MongoBucketBatchV3 extends MongoBucketBatch {
   }
 
   async resolveTables(options: storage.ResolveTablesOptions): Promise<storage.ResolveTablesResult> {
-    const ref = options.source;
-    const syncRules = options.syncRules ?? this.sync_rules;
-    const matchingSources = syncRules.getMatchingSources(ref);
+    // The test-only override is a whole parsed set, so the sync rules and the mapping
+    // used below always come from the same parse.
+    const parsedOverride = options.parsedSyncConfig as MongoParsedSyncConfigSet | undefined;
+    const syncConfig = parsedOverride?.hydratedSyncConfig ?? this.sync_rules;
+    const mapping = parsedOverride?.mapping ?? this.mapping;
+    const eventById = (parsedOverride ?? this.options.parsedSyncConfig).eventById;
 
     const { connection_id, source } = options;
-    const { schema, name, objectId, replicaIdColumns, connectionTag, sendsCompleteRows } = source;
-    const normalizedReplicaIdColumns = replicaIdColumns.map((column) => ({
-      name: column.name,
-      type: column.type,
-      type_oid: column.typeId
-    }));
+    const reconcile = options.reconcileSourceTables ?? storage.defaultSourceTableReconciler;
+    const identity = {
+      schema: source.schema,
+      name: source.name,
+      objectId: source.objectId,
+      replicaIdColumns: source.replicaIdColumns.map((column) => ({
+        name: column.name,
+        type: column.type,
+        type_oid: column.typeId
+      }))
+    };
 
     let result: storage.ResolveTablesResult | null = null;
-    const initializeSourceRecordsFor: bson.ObjectId[] = [];
+    const session = this.db.client.startSession();
+    await using _ = { [Symbol.asyncDispose]: () => session.endSession() };
 
-    await this.db.client.withSession(async (session) => {
-      const col = this.db.commonSourceTables(this.group_id);
-      const exactFilter: Record<string, unknown> = {
-        connection_id,
-        schema_name: schema,
-        table_name: name,
-        replica_id_columns2: normalizedReplicaIdColumns
-      };
-      if (objectId != null) {
-        exactFilter.relation_id = objectId;
-      }
+    await this.withTransaction(async () => {
+      const col = this.db.sourceTables(this.replicationStreamId);
 
-      const exactDocs = (await col.find(exactFilter, { session }).toArray()) as SourceTableDocumentV3[];
-      const bucketSourceById = new Map(
-        matchingSources.bucketDataSources.map((source) => [this.mapping.bucketSourceId(source), source] as const)
-      );
-      const parameterLookupSourceById = new Map(
-        matchingSources.parameterLookupSources.map(
-          (source) => [this.mapping.parameterLookupId(source), source] as const
-        )
-      );
-      const desiredBucketIds = new Set(bucketSourceById.keys());
-      const desiredLookupIds = new Set(parameterLookupSourceById.keys());
-      const desiredHasMembership = desiredBucketIds.size > 0 || desiredLookupIds.size > 0;
-      const triggersEvent = syncRules.tableTriggersEvent(ref);
-
-      const coveredBucketIds = new Set<string>();
-      const coveredLookupIds = new Set<string>();
-      const retainedDocIds: bson.ObjectId[] = [];
-      const tables: storage.SourceTable[] = [];
-      let retainedEventOnlyTable = false;
-
-      for (const doc of exactDocs) {
-        const bucketDataSourceIds = doc.bucket_data_source_ids.filter((id) => desiredBucketIds.has(id));
-        const parameterLookupSourceIds = doc.parameter_lookup_source_ids.filter((id) => desiredLookupIds.has(id));
-        const coversDesiredMembership = bucketDataSourceIds.length > 0 || parameterLookupSourceIds.length > 0;
-        const coversEventOnlyTable = !desiredHasMembership && triggersEvent && !retainedEventOnlyTable;
-
-        for (const id of bucketDataSourceIds) {
-          coveredBucketIds.add(id);
-        }
-        for (const id of parameterLookupSourceIds) {
-          coveredLookupIds.add(id);
-        }
-
-        const updates: Partial<SourceTableDocumentV3> = {};
-        if (
-          !sameStringArray(doc.bucket_data_source_ids, bucketDataSourceIds) ||
-          !sameStringArray(doc.parameter_lookup_source_ids, parameterLookupSourceIds)
-        ) {
-          updates.bucket_data_source_ids = bucketDataSourceIds;
-          updates.parameter_lookup_source_ids = parameterLookupSourceIds;
-        }
-        if (Object.keys(updates).length > 0) {
-          await col.updateOne({ _id: doc._id }, { $set: updates }, { session });
-        }
-
-        if (coversDesiredMembership || coversEventOnlyTable) {
-          if (coversEventOnlyTable) {
-            retainedEventOnlyTable = true;
-          }
-          retainedDocIds.push(doc._id);
-          const table = this.sourceTableFromDocument(
-            {
-              ...doc,
-              bucket_data_source_ids: bucketDataSourceIds,
-              parameter_lookup_source_ids: parameterLookupSourceIds
-            },
-            connectionTag,
-            syncRules,
-            {
-              bucketDataSources: bucketDataSourceIds.map((id) => bucketSourceById.get(id)!),
-              parameterLookupSources: parameterLookupSourceIds.map((id) => parameterLookupSourceById.get(id)!)
-            }
-          );
-          table.storeCurrentData = sendsCompleteRows !== true;
-          tables.push(table);
-        }
-      }
-
-      const uncoveredBucketIds = [...desiredBucketIds].filter((id) => !coveredBucketIds.has(id));
-      const uncoveredLookupIds = [...desiredLookupIds].filter((id) => !coveredLookupIds.has(id));
-
-      if (uncoveredBucketIds.length > 0 || uncoveredLookupIds.length > 0 || (triggersEvent && tables.length == 0)) {
-        const id = options.idGenerator ? (options.idGenerator() as bson.ObjectId) : new bson.ObjectId();
-        const sourceTable = new storage.SourceTable({
-          id,
-          ref,
-          objectId,
-          replicaIdColumns,
-          snapshotComplete: false,
-          bucketDataSources: uncoveredBucketIds.map((id) => bucketSourceById.get(id)!),
-          parameterLookupSources: uncoveredLookupIds.map((id) => parameterLookupSourceById.get(id)!)
-        });
-        sourceTable.syncData = uncoveredBucketIds.length > 0;
-        sourceTable.syncParameters = uncoveredLookupIds.length > 0;
-        sourceTable.syncEvent = triggersEvent;
-        sourceTable.storeCurrentData = sendsCompleteRows !== true;
-
-        const createDoc: SourceTableDocumentV3 = {
-          _id: id,
-          connection_id,
-          relation_id: objectId,
-          schema_name: schema,
-          table_name: name,
-          replica_id_columns: null,
-          replica_id_columns2: normalizedReplicaIdColumns,
-          snapshot_done: false,
-          snapshot_status: undefined,
-          bucket_data_source_ids: uncoveredBucketIds,
-          parameter_lookup_source_ids: uncoveredLookupIds
-        };
-
-        await col.insertOne(createDoc, { session });
-        initializeSourceRecordsFor.push(createDoc._id);
-        retainedDocIds.push(createDoc._id);
-        tables.push(sourceTable);
-      }
-
-      const conflictFilter = [{ schema_name: schema, table_name: name }] as Record<string, unknown>[];
-      if (objectId != null) {
-        conflictFilter.push({ relation_id: objectId });
-      }
-      const dropTables = await col
-        .find(
-          {
-            connection_id,
-            _id: { $nin: retainedDocIds },
-            $or: conflictFilter
-          },
-          { session }
-        )
+      // Find records that overlap by name or relation id.
+      const candidateDocs = await col
+        .find(overlappingSourceTableFilter(connection_id, identity), { session })
         .toArray();
 
+      const candidateTables = candidateDocs.map((doc) =>
+        sourceTableFromDocument(doc, source.connectionTag, syncConfig, mapping, eventById)
+      );
+      const candidates = candidateTables.map((table) => table.clone());
+      const resolution = await reconcile({ source, candidates });
+      storage.validateSourceTableCandidateResolution(candidates, resolution);
+
+      // Persist metadata from the reconciler without mutating the queried documents.
+      for (const { id, sourceMetadata } of storage.diffSourceTableUpdates(candidateTables, resolution)) {
+        await col.updateOne({ _id: mongoTableId(id) }, { $set: { source_metadata: sourceMetadata } }, { session });
+      }
+
+      const context: SourceTableReconciliationContext = {
+        connectionId: connection_id,
+        connectionTag: source.connectionTag,
+        identity,
+        storeCurrentData: source.sendsCompleteRows !== true,
+        syncConfig,
+        mapping,
+        desired: sourceTableDesiredResolution(syncConfig, source, mapping, eventById),
+        sourceCompatibleTables: resolution.compatibleTables,
+        newTableSourceMetadata: resolution.newTableValues.sourceMetadata
+      };
+
+      // Plan record reuse, membership changes, creation, and removal.
+      const plan = planSourceTableReconciliation(candidateDocs, context);
+
+      // Persist narrowing for incomplete snapshots only. Snapshot-complete docs keep stale
+      // coverage ids so compatible future configs can reuse already-snapshotted data.
+      // Narrowing occurs after removing a sync config, meaning we don't process those
+      // definitions anymore.
+      for (const update of plan.narrowingUpdates) {
+        await col.updateOne(
+          { _id: update.id },
+          {
+            $set: {
+              bucket_data_source_ids: update.memberships.bucketDataSourceIds,
+              parameter_lookup_source_ids: update.memberships.parameterLookupSourceIds,
+              event_definition_ids: update.memberships.eventDefinitionIds
+            }
+          },
+          { session }
+        );
+      }
+
+      // Any desired membership not covered by an existing doc gets a new source table.
+      // That table snapshots only the uncovered memberships.
+      if (plan.newTableMemberships != null) {
+        const id = options.idGenerator ? (options.idGenerator() as bson.ObjectId) : new bson.ObjectId();
+        const { doc, table } = createNewSourceTable(id, plan.newTableMemberships, context);
+
+        await col.insertOne(doc, { session });
+        await this.db.initializeSourceRecordsCollection(this.replicationStreamId, doc._id, session);
+        plan.tables.push(table);
+      }
+
       result = {
-        tables,
-        dropTables: dropTables.map((doc) =>
-          this.sourceTableFromDocument(doc as SourceTableDocumentV3, connectionTag, syncRules)
+        tables: plan.tables,
+        dropTables: plan.dropDocs.map((doc) =>
+          sourceTableFromDocument(doc, context.connectionTag, syncConfig, mapping, eventById)
         )
       };
-    });
-
-    for (const sourceTableId of initializeSourceRecordsFor) {
-      await this.db.initializeSourceRecordsCollection(this.group_id, sourceTableId);
-    }
+    }, session);
 
     return result!;
   }
 
-  private sourceTableFromDocument(
-    doc: SourceTableDocumentV3,
-    connectionTag: string,
-    syncRules: HydratedSyncConfig,
-    memberships?: MatchingSources
-  ): storage.SourceTable {
-    const resolvedMemberships = memberships ?? this.sourceTableMembershipsFromDocument(doc, syncRules);
-    const table = new storage.SourceTable({
-      id: doc._id,
-      ref: {
-        connectionTag,
-        schema: doc.schema_name,
-        name: doc.table_name
-      },
-      objectId: doc.relation_id,
-      replicaIdColumns: doc.replica_id_columns2!.map(
-        (c) => ({ name: c.name, typeId: c.type_oid, type: c.type }) satisfies ColumnDescriptor
-      ),
-      snapshotComplete: doc.snapshot_done ?? true,
-      bucketDataSources: resolvedMemberships.bucketDataSources,
-      parameterLookupSources: resolvedMemberships.parameterLookupSources
-    });
-    table.syncData = table.bucketDataSources.length > 0;
-    table.syncParameters = table.parameterLookupSources.length > 0;
-    table.syncEvent = syncRules.tableTriggersEvent(table.ref);
-    table.snapshotStatus =
-      doc.snapshot_status == null
-        ? undefined
-        : {
-            lastKey: doc.snapshot_status.last_key?.buffer ?? null,
-            totalEstimatedCount: doc.snapshot_status.total_estimated_count,
-            replicatedCount: doc.snapshot_status.replicated_count
-          };
-    return table;
-  }
-
-  private sourceTableMembershipsFromDocument(
-    doc: SourceTableDocumentV3,
-    syncRules: HydratedSyncConfig
-  ): MatchingSources {
-    const bucketDataSourceIds = new Set(doc.bucket_data_source_ids);
-    const parameterLookupSourceIds = new Set(doc.parameter_lookup_source_ids);
-
-    return {
-      bucketDataSources: syncRules.bucketDataSources.filter((source) =>
-        bucketDataSourceIds.has(this.mapping.bucketSourceId(source))
-      ),
-      parameterLookupSources: syncRules.bucketParameterLookupSources.filter((source) =>
-        parameterLookupSourceIds.has(this.mapping.parameterLookupId(source))
-      )
-    };
-  }
-
   async getSourceTableStatus(table: storage.SourceTable): Promise<storage.SourceTable | null> {
     const doc = (await this.db
-      .commonSourceTables(this.group_id)
+      .sourceTables(this.replicationStreamId)
       .findOne({ _id: mongoTableId(table.id) }, { session: this.session })) as SourceTableDocumentV3 | null;
     if (doc == null) {
       return null;
     }
 
-    return this.sourceTableFromDocument(doc, table.ref.connectionTag, this.sync_rules);
+    return sourceTableFromDocument(
+      doc,
+      table.ref.connectionTag,
+      this.sync_rules,
+      this.mapping,
+      this.options.parsedSyncConfig.eventById
+    );
   }
 
   async commit(lsn: string, options?: storage.BucketBatchCommitOptions): Promise<storage.CheckpointResult> {
     const { createEmptyCheckpoints } = { ...storage.DEFAULT_BUCKET_BATCH_COMMIT_OPTIONS, ...options };
 
-    await this.flush(options);
+    using _ = this.tracer.span('storage', 'commit');
 
-    const now = new Date();
-
-    await this.db.write_checkpoints.updateMany(
-      {
-        processed_at_lsn: null,
-        'lsns.1': { $lte: lsn }
-      },
-      {
-        $set: {
-          processed_at_lsn: lsn
-        }
-      },
-      {
-        session: this.session
-      }
-    );
-
-    const preUpdateDocument = await this.db.sync_rules.findOne(
-      {
-        _id: this.group_id,
-        'sync_configs._id': this.syncConfigId
-      },
-      {
-        session: this.session,
-        projection: {
-          snapshot_lsn: 1,
-          sync_configs: {
-            $elemMatch: {
-              _id: this.syncConfigId
-            }
-          }
-        }
-      }
-    );
-
-    const state = (preUpdateDocument as ReplicationStreamDocumentV3)?.sync_configs?.[0];
-    if (state == null) {
-      throw new ReplicationAssertionError(
-        `Failed to update checkpoint - no matching sync_config for _id: ${this.group_id}/${this.syncConfigId.toHexString()}`
+    const checkpoint = async (stream: SyncRuleDocumentBase, lastOp?: InternalOpId) => {
+      const now = new Date();
+      const preUpdateDocument = stream as ReplicationStreamDocumentV3;
+      const writes = this.db.createWriteBatch(this.session, { ordered: false });
+      writes.updateMany(
+        this.db.write_checkpoints,
+        { processed_at_lsn: null, 'lsns.1': { $lte: lsn } },
+        { $set: { processed_at_lsn: lsn } }
       );
-    }
 
-    const checkpointState = calculateCheckpointState({
-      lsn,
-      snapshotDone: state.snapshot_done === true,
-      lastCheckpointLsn: state.last_checkpoint_lsn,
-      noCheckpointBefore: state.no_checkpoint_before,
-      keepaliveOp: state.keepalive_op == null ? null : BigInt(state.keepalive_op),
-      lastCheckpoint: state.last_checkpoint,
-      persistedOp: this.persisted_op,
-      createEmptyCheckpoints
-    });
-
-    const updateSet: Record<string, any> = {
-      last_keepalive_ts: now,
-      last_fatal_error: null,
-      last_fatal_error_ts: null,
-      'sync_configs.$[config].keepalive_op': checkpointState.newKeepaliveOp,
-      'sync_configs.$[config].last_checkpoint': checkpointState.newLastCheckpoint
-    };
-    if (checkpointState.checkpointCreated) {
-      updateSet['sync_configs.$[config].last_checkpoint_lsn'] = lsn;
-      updateSet['snapshot_lsn'] = null;
-      updateSet['last_checkpoint_ts'] = now;
-    }
-
-    await this.db.sync_rules.updateOne(
-      {
-        _id: this.group_id,
-        'sync_configs._id': this.syncConfigId
-      },
-      {
-        $set: updateSet
-      },
-      {
-        session: this.session,
-        arrayFilters: [{ 'config._id': this.syncConfigId }]
+      const states =
+        preUpdateDocument?.sync_configs?.filter((config) => this.syncConfigIds.some((id) => id.equals(config._id))) ??
+        [];
+      if (states.length == 0) {
+        throw new ReplicationAssertionError(
+          `Failed to update checkpoint - no matching sync_config for _id: ${this.replicationStreamId}/${this.syncConfigIds
+            .map((id) => id.toHexString())
+            .join(',')}`
+        );
       }
-    );
+      // The replication job / MongoBucketBatch must be constructed with all replicating (PROCESSING / ACTIVE)
+      // sync configs in the stream, otherwise we'll get inconsistencies. Configs in other states (e.g. STOP)
+      // remain embedded in the document and are ignored here.
+      const missingSyncConfig = preUpdateDocument!.sync_configs.find(
+        (config) =>
+          [storage.SyncRuleState.PROCESSING, storage.SyncRuleState.ACTIVE].includes(config.state) &&
+          !this.syncConfigIds.some((id) => id.equals(config._id))
+      );
+      if (missingSyncConfig != null) {
+        throw new ReplicationAssertionError(`Replication job not configured for sync config ${missingSyncConfig._id}`);
+      }
 
-    if (checkpointState.checkpointBlocked) {
+      // Effective head of the stream's op sequence.
+      // A combined flush supplies its new head; an empty commit uses the fenced persisted head.
+      const newCheckpoint = lastOp ?? this.persistedOpHead(preUpdateDocument);
+
+      let checkpointBlocked = false;
+      let checkpointCreated = false;
+      let checkpointLogState: unknown = null;
+      const unblockedConfigIds: bson.ObjectId[] = [];
+
+      for (const state of states) {
+        if (state.last_checkpoint != null && state.last_checkpoint > newCheckpoint) {
+          // last_persisted_op is $max-advanced durably in the same transaction as every flush, and
+          // checkpoints are only ever created at that head, so a checkpoint past the head means the
+          // op sequence or the stored state is corrupt.
+          throw new ReplicationAssertionError(
+            `Invariant violation: sync config ${state._id} has last_checkpoint ${state.last_checkpoint} > stream head ${newCheckpoint}`
+          );
+        }
+
+        const canCheckpoint = canCheckpointState(lsn, {
+          snapshotDone: state.snapshot_done === true,
+          lastCheckpointLsn: state.last_checkpoint_lsn,
+          noCheckpointBefore: state.no_checkpoint_before
+        });
+
+        if (!canCheckpoint) {
+          checkpointBlocked = true;
+          // Log the first blocked config's state.
+          checkpointLogState ??= {
+            snapshot_done: state.snapshot_done,
+            last_checkpoint_lsn: state.last_checkpoint_lsn,
+            no_checkpoint_before: state.no_checkpoint_before
+          };
+          continue;
+        }
+
+        checkpointCreated ||= createEmptyCheckpoints || state.last_checkpoint !== newCheckpoint;
+        unblockedConfigIds.push(state._id);
+      }
+
+      // Every commit advances the stream's resume position: commit() flushes first, so all
+      // source changes up to this lsn have been persisted, even when checkpoints are blocked.
+      // In the future we could also advance this on flush, when the connector provides the
+      // current position (see setResumeLsn, which connectors may already call after flushing).
+      const resumeLsnUpdate = {
+        resume_lsn: lsn,
+        ...(lastOp == null ? {} : { last_persisted_op: lastOp })
+      };
+
+      if (unblockedConfigIds.length > 0) {
+        // All unblocked configs get the SAME new value, so we apply it with a single updateOne
+        // (single-document atomicity).
+        const updateSet: Record<string, any> = {
+          last_fatal_error: null,
+          last_fatal_error_ts: null
+        };
+        // Only advance checkpoint fields when an actual (non-empty) checkpoint is created, matching
+        // the previous per-config / v1 behaviour.
+        if (checkpointCreated) {
+          updateSet['sync_configs.$[config].last_checkpoint'] = newCheckpoint;
+          updateSet['sync_configs.$[config].last_checkpoint_lsn'] = lsn;
+          updateSet['last_checkpoint_ts'] = now;
+        }
+
+        writes.updateOne(
+          this.db.sync_rules,
+          {
+            _id: this.replicationStreamId,
+            'sync_configs._id': { $in: unblockedConfigIds }
+          },
+          { $set: updateSet, $max: resumeLsnUpdate },
+          {
+            arrayFilters: checkpointCreated ? [{ 'config._id': { $in: unblockedConfigIds } }] : undefined
+          }
+        );
+      } else {
+        // All selected configs are blocked - only update keepalive/error tracking and the
+        // resume position.
+        writes.updateOne(
+          this.db.sync_rules,
+          {
+            _id: this.replicationStreamId
+          },
+          {
+            $set: {
+              last_fatal_error: null,
+              last_fatal_error_ts: null
+            },
+            $max: resumeLsnUpdate
+          }
+        );
+      }
+
+      await writes.execute();
+      return { checkpointBlocked, checkpointCreated, checkpointLogState, newCheckpoint };
+    };
+    const projection = { sync_configs: 1, last_persisted_op: 1 };
+    const { checkpointBlocked, checkpointCreated, checkpointLogState, newCheckpoint } = await this.flushAndCommit(
+      checkpoint,
+      () => this.withFencedTransaction(() => this.fence(this.session, projection), checkpoint),
+      options,
+      projection
+    );
+    if (checkpointBlocked) {
       if (Date.now() - this.lastWaitingLogThrottledV3 > 5_000) {
         this.logger.info(
-          `Waiting before creating checkpoint, currently at ${lsn} / ${checkpointState.newKeepaliveOp}. Current state: ${JSON.stringify(
-            {
-              snapshot_done: state.snapshot_done,
-              last_checkpoint_lsn: state.last_checkpoint_lsn,
-              no_checkpoint_before: state.no_checkpoint_before
-            }
-          )}`
+          `Waiting before creating checkpoint, currently at ${lsn}. Current state: ${JSON.stringify(checkpointLogState)}`
         );
         this.lastWaitingLogThrottledV3 = Date.now();
       }
     } else {
-      if (checkpointState.checkpointCreated) {
-        this.logger.debug(`Created checkpoint at ${lsn} / ${checkpointState.newLastCheckpoint}`);
+      if (checkpointCreated) {
+        this.logger.debug(`Created checkpoint at ${lsn}`);
       }
       await this.autoActivateV3(lsn);
+      // All configs are now checkpointed at newCheckpoint (the stream head).
+      await this.sourceRecordStore.postCommitCleanup(newCheckpoint, this.logger);
+    }
+    if (checkpointCreated) {
       await this.db.notifyCheckpoint();
-      this.persisted_op = null;
-      this.last_checkpoint_lsn = lsn;
-      if (checkpointState.newLastCheckpoint != null) {
-        await this.sourceRecordStore.postCommitCleanup(checkpointState.newLastCheckpoint, this.logger);
-      }
     }
     return {
-      checkpointBlocked: checkpointState.checkpointBlocked,
-      checkpointCreated: checkpointState.checkpointCreated
+      checkpointBlocked,
+      checkpointCreated
     };
   }
 
@@ -409,18 +437,10 @@ export class MongoBucketBatchV3 extends MongoBucketBatch {
   }
 
   async setResumeLsn(lsn: string): Promise<void> {
-    await this.db.sync_rules.updateOne(
-      {
-        _id: this.group_id,
-        'sync_configs._id': this.syncConfigId
-      },
-      {
-        $set: {
-          snapshot_lsn: lsn
-        }
-      },
-      { session: this.session }
-    );
+    using _ = this.tracer.span('storage', 'set_resume_lsn');
+    // Losing occasional resume LSN would only reprocess source changes.
+    // Keep the lease check atomic, but do not wait for majority replication of this resume hint.
+    await this.updateStreamMetadata({ resume_lsn: { $literal: lsn } }, {}, { w: 1 });
   }
 
   private async autoActivateV3(lsn: string): Promise<void> {
@@ -430,36 +450,43 @@ export class MongoBucketBatchV3 extends MongoBucketBatch {
 
     const session = this.session;
     let activated = false;
-    await session.withTransaction(async () => {
+    let needsFutureActivationCheck = true;
+    await this.withTransaction(async () => {
+      // Reset on transaction retries.
+      needsFutureActivationCheck = true;
+      activated = false;
+
       const doc = await this.db.sync_rules.findOne(
         {
-          _id: this.group_id,
-          'sync_configs._id': this.syncConfigId
+          _id: this.replicationStreamId,
+          'sync_configs._id': { $in: this.syncConfigIds }
         },
         {
           session,
           projection: {
             state: 1,
-            sync_configs: {
-              $elemMatch: {
-                _id: this.syncConfigId
-              }
-            }
+            sync_configs: 1
           }
         }
       );
-      const state = (doc as ReplicationStreamDocumentV3)?.sync_configs?.[0];
+      const states =
+        (doc as ReplicationStreamDocumentV3)?.sync_configs?.filter((config) =>
+          this.syncConfigIds.some((id) => id.equals(config._id))
+        ) ?? [];
+      if (doc == null || states.length == 0) {
+        return;
+      }
+
+      const processingStates = states.filter((state) => state.state == storage.SyncRuleState.PROCESSING);
       if (
-        doc &&
         doc.state == storage.SyncRuleState.PROCESSING &&
-        state?.state == storage.SyncRuleState.PROCESSING &&
-        state.snapshot_done &&
-        state.last_checkpoint != null
+        processingStates.length == states.length &&
+        states.every((state) => state.snapshot_done && state.last_checkpoint != null)
       ) {
         await this.db.sync_rules.updateOne(
           {
-            _id: this.group_id,
-            'sync_configs._id': this.syncConfigId
+            _id: this.replicationStreamId,
+            'sync_configs._id': { $in: this.syncConfigIds }
           },
           {
             $set: {
@@ -469,91 +496,125 @@ export class MongoBucketBatchV3 extends MongoBucketBatch {
           },
           {
             session,
-            arrayFilters: [{ 'config._id': this.syncConfigId }]
+            arrayFilters: [{ 'config._id': { $in: this.syncConfigIds } }]
           }
         );
 
         await this.db.sync_rules.updateMany(
           {
-            _id: { $ne: this.group_id },
+            _id: { $ne: this.replicationStreamId },
             state: { $in: [storage.SyncRuleState.ACTIVE, storage.SyncRuleState.ERRORED] }
           },
-          syncRuleStateUpdatePipeline(storage.SyncRuleState.STOP),
+          stopReplicationStreamPipeline(),
           { session }
         );
         activated = true;
-      } else if (doc?.state != storage.SyncRuleState.PROCESSING) {
-        this.needsActivationV3 = false;
+      } else if (
+        doc.state == storage.SyncRuleState.ACTIVE &&
+        processingStates.length > 0 &&
+        processingStates.every((state) => state.snapshot_done && state.last_checkpoint != null)
+      ) {
+        await this.db.sync_rules.updateOne(
+          {
+            _id: this.replicationStreamId,
+            'sync_configs._id': { $in: processingStates.map((state) => state._id) }
+          },
+          {
+            $set: {
+              'sync_configs.$[activeConfig].state': storage.SyncRuleState.STOP,
+              'sync_configs.$[processingConfig].state': storage.SyncRuleState.ACTIVE
+            }
+          },
+          {
+            session,
+            arrayFilters: [
+              { 'activeConfig.state': storage.SyncRuleState.ACTIVE },
+              { 'processingConfig._id': { $in: processingStates.map((state) => state._id) } }
+            ]
+          }
+        );
+        activated = true;
+      } else if (doc.state != storage.SyncRuleState.PROCESSING && doc.state != storage.SyncRuleState.ACTIVE) {
+        needsFutureActivationCheck = false;
+      } else if (doc.state == storage.SyncRuleState.ACTIVE && processingStates.length == 0) {
+        needsFutureActivationCheck = false;
       }
-    });
+    }, session);
     if (activated) {
       this.logger.info(`Activated new replication stream at ${lsn}`);
       await this.db.notifyCheckpoint();
       this.needsActivationV3 = false;
+    } else if (!needsFutureActivationCheck) {
+      this.needsActivationV3 = false;
     }
   }
 
-  async markAllSnapshotDone(no_checkpoint_before_lsn: string): Promise<void> {
-    await this.db.sync_rules.updateOne(
-      {
-        _id: this.group_id,
-        'sync_configs._id': this.syncConfigId
-      },
-      {
-        $set: {
-          'sync_configs.$[config].snapshot_done': true,
-          last_keepalive_ts: new Date()
-        },
-        $max: {
-          'sync_configs.$[config].no_checkpoint_before': no_checkpoint_before_lsn
+  private syncConfigMetadataUpdate(syncConfigIds: bson.ObjectId[], set: lib_mongo.mongo.Document) {
+    return {
+      sync_configs: {
+        $map: {
+          input: '$sync_configs',
+          as: 'config',
+          in: {
+            $cond: [
+              { $in: ['$$config._id', { $literal: syncConfigIds }] },
+              { $mergeObjects: ['$$config', set] },
+              '$$config'
+            ]
+          }
         }
-      },
-      {
-        session: this.session,
-        arrayFilters: [{ 'config._id': this.syncConfigId }]
       }
-    );
+    };
+  }
+
+  private snapshotDoneUpdate(no_checkpoint_before_lsn: string) {
+    return this.syncConfigMetadataUpdate(this.syncConfigIds, {
+      snapshot_done: true,
+      no_checkpoint_before: { $max: ['$$config.no_checkpoint_before', { $literal: no_checkpoint_before_lsn }] }
+    });
+  }
+
+  async markAllSnapshotDone(no_checkpoint_before_lsn: string): Promise<void> {
+    await this.updateStreamMetadata(this.snapshotDoneUpdate(no_checkpoint_before_lsn), {
+      'sync_configs._id': { $in: this.syncConfigIds }
+    });
   }
 
   async markSnapshotDone(no_checkpoint_before_lsn: string, options?: { throwOnConflict?: boolean }): Promise<void> {
     await this.withTransaction(async () => {
       // Protect against race conditions
-      const count = await this.db.sourceTablesV3(this.group_id).countDocuments(
-        {
-          snapshot_done: false
-        },
-        { session: this.session }
-      );
-      if (count > 0) {
+      const blockingTables = await this.db
+        .sourceTables(this.replicationStreamId)
+        .find(this.snapshotBlockingSourceTablesFilter(), {
+          session: this.session,
+          projection: { schema_name: 1, table_name: 1 }
+        })
+        .toArray();
+
+      if (blockingTables.length > 0) {
         if (options?.throwOnConflict ?? true) {
           throw new ReplicationAssertionError(
-            `Cannot mark snapshot done while ${count} source table${count == 1 ? '' : 's'} still require snapshotting`
+            `Cannot mark snapshot done while source tables still require snapshotting. Tables: ${blockingTables.map((t) => `${t.schema_name}.${t.table_name}`).join(', ')}`
           );
         } else {
           return;
         }
       }
 
-      await this.markAllSnapshotDone(no_checkpoint_before_lsn);
+      await this.updateStreamMetadataInTransaction(this.snapshotDoneUpdate(no_checkpoint_before_lsn), {
+        'sync_configs._id': { $in: this.syncConfigIds }
+      });
     });
   }
 
-  async markTableSnapshotRequired(_table: storage.SourceTable): Promise<void> {
-    await this.db.sync_rules.updateOne(
-      {
-        _id: this.group_id,
-        'sync_configs._id': this.syncConfigId
-      },
-      {
-        $set: {
-          'sync_configs.$[config].snapshot_done': false
-        }
-      },
-      {
-        session: this.session,
-        arrayFilters: [{ 'config._id': this.syncConfigId }]
-      }
-    );
+  async markTableSnapshotRequired(table: storage.SourceTable): Promise<void> {
+    const syncConfigIds = this.relevantSyncConfigIds(table);
+    if (syncConfigIds.length == 0) {
+      return;
+    }
+    await this.updateStreamMetadata(this.syncConfigMetadataUpdate(syncConfigIds, { snapshot_done: false }), {
+      'sync_configs._id': { $in: syncConfigIds }
+    });
   }
 
   async markTableSnapshotDone(
@@ -562,9 +623,12 @@ export class MongoBucketBatchV3 extends MongoBucketBatch {
   ): Promise<storage.SourceTable[]> {
     const session = this.session;
     const ids = tables.map((table) => mongoTableId(table.id));
+    const syncConfigIds = this.relevantSyncConfigIdsForTables(tables);
 
     await this.withTransaction(async () => {
-      await this.db.commonSourceTables(this.group_id).updateMany(
+      const writes = this.db.createWriteBatch(session, { ordered: false });
+      writes.updateMany(
+        this.db.sourceTables(this.replicationStreamId),
         { _id: { $in: ids } },
         {
           $set: {
@@ -573,35 +637,127 @@ export class MongoBucketBatchV3 extends MongoBucketBatch {
           $unset: {
             snapshot_status: 1
           }
-        },
-        { session }
+        }
       );
 
-      if (no_checkpoint_before_lsn != null) {
-        await this.db.sync_rules.updateOne(
+      if (no_checkpoint_before_lsn != null && syncConfigIds.length > 0) {
+        writes.updateOne(
+          this.db.sync_rules,
           {
-            _id: this.group_id,
-            'sync_configs._id': this.syncConfigId
+            _id: this.replicationStreamId,
+            'sync_configs._id': { $in: syncConfigIds }
           },
           {
-            $set: {
-              last_keepalive_ts: new Date()
-            },
             $max: {
               'sync_configs.$[config].no_checkpoint_before': no_checkpoint_before_lsn
             }
           },
           {
-            session: this.session,
-            arrayFilters: [{ 'config._id': this.syncConfigId }]
+            // Only set for sync configs that use this table
+            arrayFilters: [{ 'config._id': { $in: syncConfigIds } }]
           }
         );
       }
+      await writes.execute();
     });
     return tables.map((table) => {
       const copy = table.clone();
       copy.snapshotComplete = true;
       return copy;
     });
+  }
+
+  protected override async batchCreateCustomWriteCheckpoints(
+    session: lib_mongo.mongo.ClientSession,
+    opId: InternalOpId
+  ): Promise<void> {
+    if (this.write_checkpoint_batch.length == 0) {
+      return;
+    }
+
+    const checkpointsByEvent = Map.groupBy(this.write_checkpoint_batch, (checkpoint) =>
+      this.validateCustomCheckpointEventId(checkpoint.event_id)
+    );
+
+    const writes = this.db.createWriteBatch(session, { ordered: false });
+    for (const [eventId, checkpoints] of checkpointsByEvent) {
+      this.batchCreateEventCustomWriteCheckpoints(writes, opId, eventId, checkpoints);
+    }
+    await writes.execute();
+  }
+
+  protected override async prepareCustomWriteCheckpoints(): Promise<void> {
+    // Most events never produce custom checkpoints, so create collections lazily
+    // only for the event ids present in this batch. This hook runs before the
+    // replication transaction because MongoDB cannot create indexes within it.
+    const eventIds = new Set(
+      this.write_checkpoint_batch.map((checkpoint) => this.validateCustomCheckpointEventId(checkpoint.event_id))
+    );
+    for (const eventId of eventIds) {
+      if (this.initializedCustomCheckpointEventIds.has(eventId)) {
+        continue;
+      }
+      await this.db.initializeCustomCheckpointRequestsCollection({
+        replicationStreamId: this.replicationStreamId,
+        eventId
+      });
+      this.initializedCustomCheckpointEventIds.add(eventId);
+    }
+  }
+
+  private validateCustomCheckpointEventId(eventId: EventDefinitionId | undefined): EventDefinitionId {
+    if (eventId == null) {
+      throw new ServiceAssertionError('V3 custom checkpoints require an event definition id');
+    }
+
+    if (!this.knownEventIds.has(eventId)) {
+      throw new ServiceAssertionError(`Unknown custom checkpoint event definition ${eventId}`);
+    }
+    return eventId;
+  }
+
+  private batchCreateEventCustomWriteCheckpoints(
+    writes: MongoWriteBatch,
+    opId: InternalOpId,
+    eventId: EventDefinitionId,
+    checkpoints: storage.CustomWriteCheckpointOptions[]
+  ): void {
+    // A repeated user within an event replaces the complete checkpoint state.
+    const uniqueCheckpoints = new Map(checkpoints.map((checkpoint) => [checkpoint.user_id, checkpoint]));
+    writes.bulkWriteUnordered(
+      this.db.customCheckpointRequests({
+        eventId,
+        replicationStreamId: this.replicationStreamId
+      }),
+      [...uniqueCheckpoints.values()].map((checkpointOptions) => {
+        const set: Partial<CustomCheckpointRequestDocumentV3> = {
+          user_id: checkpointOptions.user_id,
+          checkpoint: checkpointOptions.checkpoint,
+          op_id: opId
+        };
+        if (checkpointOptions.checkpoint_requested_at != null) {
+          set.checkpoint_requested_at = checkpointOptions.checkpoint_requested_at;
+        }
+
+        return {
+          updateOne: {
+            filter: {
+              user_id: checkpointOptions.user_id
+            },
+            update: {
+              $set: set,
+              ...(checkpointOptions.checkpoint_requested_at == null
+                ? {
+                    $unset: {
+                      checkpoint_requested_at: 1
+                    }
+                  }
+                : {})
+            },
+            upsert: true
+          }
+        };
+      })
+    );
   }
 }

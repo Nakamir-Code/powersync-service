@@ -3,14 +3,15 @@ import { BucketDataSource, BucketDefinitionId, EvaluatedParameters, EvaluatedRow
 import * as bson from 'bson';
 
 import { logger as defaultLogger, Logger } from '@powersync/lib-services-framework';
-import { InternalOpId, storage, utils } from '@powersync/service-core';
+import { BucketDefinitionMapping, InternalOpId, storage, utils } from '@powersync/service-core';
 import { JSONBig } from '@powersync/service-jsonbig';
 import { mongoTableId, replicaIdToSubkey } from '../../../utils/util.js';
-import { BucketDefinitionMapping } from '../BucketDefinitionMapping.js';
 import { currentBucketKey, MAX_ROW_SIZE } from '../MongoBucketBatchShared.js';
 import { MongoIdSequence } from '../MongoIdSequence.js';
+import { MongoWriteBatch } from '../MongoWriteBatch.js';
 import type { VersionedPowerSyncMongo } from '../db.js';
 import { TaggedBucketParameterDocument } from '../models.js';
+import { ObjectStorage } from '../v3/object-storage/ObjectStorage.js';
 import { BucketDataDoc, BucketKey } from './BucketDataDoc.js';
 import { SourceRecordBucketState, SourceRecordLookupState } from './SourceRecordStore.js';
 
@@ -34,6 +35,8 @@ const MAX_TRANSACTION_BATCH_SIZE = 30_000_000;
  * This has an effect on error message size in some cases.
  */
 const MAX_TRANSACTION_DOC_COUNT = 2_000;
+
+export const DEFAULT_INLINE_THRESHOLD_BYTES = 16 * 1024;
 
 export interface SaveBucketDataOptions {
   op_seq: MongoIdSequence;
@@ -61,6 +64,13 @@ export interface UpsertCurrentDataOptions {
 
 export interface PersistedBatchOptions {
   logger?: Logger;
+  objectStorage?: ObjectStorage;
+  inlineThresholdBytes?: number;
+  /**
+   * Aborts in-flight object storage uploads when replication stops.
+   */
+  signal?: AbortSignal;
+  objectStorageUsageWriterId?: string;
 }
 
 /**
@@ -74,6 +84,11 @@ export abstract class PersistedBatch {
   bucketData: BucketDataDoc[] = [];
   bucketParameters: TaggedBucketParameterDocument[] = [];
   bucketStates: Map<string, BucketStateUpdate> = new Map();
+
+  protected readonly objectStorage?: ObjectStorage;
+  protected readonly inlineThresholdBytes: number = DEFAULT_INLINE_THRESHOLD_BYTES;
+  protected readonly signal?: AbortSignal;
+  protected readonly objectStorageUsageWriterId?: string;
 
   /**
    * For debug logging only.
@@ -94,10 +109,16 @@ export abstract class PersistedBatch {
   ) {
     this.currentSize = writtenSize;
     this.logger = options?.logger ?? defaultLogger;
+    this.objectStorage = options?.objectStorage;
+    this.signal = options?.signal;
+    this.objectStorageUsageWriterId = options?.objectStorageUsageWriterId;
+    if (options?.inlineThresholdBytes != null) {
+      this.inlineThresholdBytes = options.inlineThresholdBytes;
+    }
   }
 
   saveBucketData(options: SaveBucketDataOptions) {
-    const remaining_buckets = new Map<string, SaveBucketDataOptions['before_buckets'][number]>();
+    const remaining_buckets = new Map<string, SourceRecordBucketState>();
     for (let bucket of options.before_buckets) {
       const mapped: SourceRecordBucketState = {
         bucket: bucket.bucket,
@@ -105,10 +126,16 @@ export abstract class PersistedBatch {
         id: bucket.id,
         table: bucket.table
       };
+      if (options.table.bucketDataSourceIds != null && !options.table.bucketDataSourceIds.has(mapped.definitionId!)) {
+        // The bucket definition is not active anymore.
+        // We don't cleanup these references upfront, but do need to ignore them after the definition is removed.
+        continue;
+      }
       remaining_buckets.set(currentBucketKey(mapped), mapped);
     }
 
-    const dchecksum = BigInt(utils.hashDelete(replicaIdToSubkey(options.table.id, options.sourceKey)));
+    const subkey = this.persistedSubkey(options.table.id, options.sourceKey);
+    const dchecksum = BigInt(utils.hashDelete(subkey));
 
     for (const evaluated of options.evaluated) {
       const definitionId = this.getBucketDefinitionId(evaluated.source);
@@ -143,6 +170,7 @@ export abstract class PersistedBatch {
         bucket: evaluated.bucket,
         sourceTableId: options.table.id,
         sourceKey: options.sourceKey,
+        subkey,
         table: evaluated.table,
         rowId: evaluated.id,
         checksum: BigInt(checksum),
@@ -165,6 +193,7 @@ export abstract class PersistedBatch {
         op_id,
         sourceTableId: options.table.id,
         sourceKey: options.sourceKey,
+        subkey,
         table: bucket.table,
         rowId: bucket.id,
         checksum: dchecksum
@@ -188,18 +217,26 @@ export abstract class PersistedBatch {
 
   protected abstract get currentDataCount(): number;
 
-  protected abstract flushBucketData(session: mongo.ClientSession): Promise<void>;
+  protected abstract queueBucketData(writes: MongoWriteBatch): Promise<void>;
 
-  protected abstract flushBucketParameters(session: mongo.ClientSession): Promise<void>;
+  protected abstract queueBucketParameters(writes: MongoWriteBatch): void;
 
-  protected abstract flushCurrentData(session: mongo.ClientSession): Promise<void>;
+  protected abstract queueCurrentData(writes: MongoWriteBatch): void;
 
-  protected abstract flushBucketStates(session: mongo.ClientSession): Promise<void>;
+  protected abstract queueBucketStates(writes: MongoWriteBatch): void;
 
   protected abstract resetCurrentData(): void;
 
   protected abstract checkDefinitionId(definitionId: BucketDefinitionId | null): BucketDefinitionId;
   protected abstract getBucketDefinitionId(bucketSource: BucketDataSource): BucketDefinitionId;
+
+  /**
+   * New bucket operations persist protocol subkeys during replication. Older
+   * V1 documents may not have one, so sync reads retain a fallback.
+   */
+  protected persistedSubkey(table: storage.SourceTableId, key: storage.ReplicaId): string {
+    return replicaIdToSubkey(table, key);
+  }
 
   protected get bucketDataCount(): number {
     return this.bucketData.length;
@@ -218,8 +255,35 @@ export abstract class PersistedBatch {
         bucket,
         lastOp: op_id,
         incrementCount: 1,
-        incrementBytes: bytes
+        incrementBytes: bytes,
+        incrementChunks: 0
       });
+    }
+  }
+
+  /**
+   * V3 persists operations in chunks. Keep this separate from incrementBucket:
+   * operation counts are known while evaluating rows, while chunk counts and
+   * exact persisted bytes are only known after the writer has chunked a flush.
+   */
+  protected incrementBucketPersistedChunk(definitionId: BucketDefinitionId, bucket: string, bytes: number) {
+    const key = `${definitionId ?? ''}:${bucket}`;
+    const existingState = this.bucketStates.get(key);
+    if (existingState != null) {
+      existingState.incrementChunks += 1;
+      existingState.incrementBytes += bytes;
+    }
+  }
+
+  /**
+   * V3's compactor calculates byte deltas from persisted chunk metadata.
+   * Replace the writer's per-operation estimate with those exact sizes before
+   * flushing the corresponding bucket state.
+   */
+  protected resetBucketPersistedBytes(definitionId: BucketDefinitionId, bucket: string) {
+    const state = this.bucketStates.get(`${definitionId ?? ''}:${bucket}`);
+    if (state != null) {
+      state.incrementBytes = 0;
     }
   }
 
@@ -229,6 +293,7 @@ export abstract class PersistedBatch {
     bucket: string;
     sourceTableId: storage.SourceTable['id'];
     sourceKey: storage.ReplicaId;
+    subkey: string;
     table: string;
     rowId: string;
     checksum: bigint;
@@ -240,6 +305,7 @@ export abstract class PersistedBatch {
       op: 'PUT',
       source_table: mongoTableId(options.sourceTableId),
       source_key: options.sourceKey,
+      subkey: options.subkey,
       table: options.table,
       row_id: options.rowId,
       checksum: options.checksum,
@@ -252,6 +318,7 @@ export abstract class PersistedBatch {
     bucketKey: BucketKey;
     sourceTableId: storage.SourceTable['id'];
     sourceKey: storage.ReplicaId;
+    subkey: string;
     table: string;
     rowId: string;
     checksum: bigint;
@@ -262,6 +329,7 @@ export abstract class PersistedBatch {
       op: 'REMOVE',
       source_table: mongoTableId(options.sourceTableId),
       source_key: options.sourceKey,
+      subkey: options.subkey,
       table: options.table,
       row_id: options.rowId,
       checksum: options.checksum,
@@ -281,23 +349,26 @@ export abstract class PersistedBatch {
   async flush(session: mongo.ClientSession, options?: storage.BucketBatchCommitOptions) {
     const startAt = performance.now();
     let flushedSomething = false;
+    const writes = this.db.createWriteBatch(session, { ordered: false });
     if (this.bucketDataCount > 0) {
       flushedSomething = true;
-      await this.flushBucketData(session);
+      await this.queueBucketData(writes);
     }
     if (this.bucketParameters.length > 0) {
       flushedSomething = true;
-      await this.flushBucketParameters(session);
+      this.queueBucketParameters(writes);
     }
     if (this.currentDataCount > 0) {
       flushedSomething = true;
-      await this.flushCurrentData(session);
+      this.queueCurrentData(writes);
     }
 
     if (this.bucketStates.size > 0) {
       flushedSomething = true;
-      await this.flushBucketStates(session);
+      this.queueBucketStates(writes);
     }
+
+    await writes.execute();
 
     if (flushedSomething) {
       const duration = Math.round(performance.now() - startAt);
@@ -305,32 +376,32 @@ export abstract class PersistedBatch {
         const replicationLag = Math.round((Date.now() - options.oldestUncommittedChange.getTime()) / 1000);
 
         this.logger.info(
-          `Flushed ${this.bucketDataCount} + ${this.bucketParameters.length} + ${
+          `Flushed: ${this.bucketDataCount} ops, ${this.bucketParameters.length} index entries, ${
             this.currentDataCount
-          } updates, ${Math.round(this.currentSize / 1024)}kb in ${duration}ms. Last op_id: ${this.debugLastOpId}. Replication lag: ${replicationLag}s`,
+          } records. ${Math.round(this.currentSize / 1024)}kb in ${duration}ms. Last op_id: ${this.debugLastOpId}. Replication lag: ${replicationLag}s`,
           {
             flushed: {
               duration: duration,
               size: this.currentSize,
-              bucket_data_count: this.bucketDataCount,
-              parameter_data_count: this.bucketParameters.length,
-              current_data_count: this.currentDataCount,
+              bucket_ops_count: this.bucketDataCount,
+              parameter_indexes_count: this.bucketParameters.length,
+              source_records_count: this.currentDataCount,
               replication_lag_seconds: replicationLag
             }
           }
         );
       } else {
         this.logger.info(
-          `Flushed ${this.bucketDataCount} + ${this.bucketParameters.length} + ${
+          `Flushed: ${this.bucketDataCount} ops, ${this.bucketParameters.length} index entries, ${
             this.currentDataCount
-          } updates, ${Math.round(this.currentSize / 1024)}kb in ${duration}ms. Last op_id: ${this.debugLastOpId}`,
+          } records. ${Math.round(this.currentSize / 1024)}kb in ${duration}ms. Last op_id: ${this.debugLastOpId}`,
           {
             flushed: {
               duration: duration,
               size: this.currentSize,
-              bucket_data_count: this.bucketDataCount,
-              parameter_data_count: this.bucketParameters.length,
-              current_data_count: this.currentDataCount
+              bucket_ops_count: this.bucketDataCount,
+              parameter_indexes_count: this.bucketParameters.length,
+              source_records_count: this.currentDataCount
             }
           }
         );
@@ -361,4 +432,5 @@ export interface BucketStateUpdate {
   lastOp: InternalOpId;
   incrementCount: number;
   incrementBytes: number;
+  incrementChunks: number;
 }

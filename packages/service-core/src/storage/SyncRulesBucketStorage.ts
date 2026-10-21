@@ -10,33 +10,45 @@ import { PerformanceTracer } from '../tracing/PerformanceTracer.js';
 import * as util from '../util/util-index.js';
 import { BucketStorageBatch, FlushedResult, SaveUpdate } from './BucketStorageBatch.js';
 import { BucketStorageFactory } from './BucketStorageFactory.js';
-import { ParseSyncRulesOptions } from './PersistedSyncRulesContent.js';
+import { ParsedSyncConfigSet } from './ParsedSyncConfigSet.js';
+import type { ParseSyncConfigOptions } from './PersistedSyncConfigContent.js';
 import { SourceEntityDescriptor } from './SourceEntity.js';
 import { SourceTable } from './SourceTable.js';
+import { SourceTableCandidateReconciler } from './SourceTableReconciler.js';
 import { StorageVersionConfig } from './StorageVersionConfig.js';
 import { SyncStorageWriteCheckpointAPI } from './WriteCheckpointAPI.js';
 
 /**
  * Storage for a specific replication stream.
+ *
+ * Replication writes source changes, source table metadata, snapshot progress,
+ * resume positions, and checkpoint boundaries through this interface. The sync
+ * API reads the same stream state as checkpoints, checksums, bucket data,
+ * parameter lookup rows, and write-checkpoint acknowledgements.
  */
 export interface SyncRulesBucketStorage
   extends ObserverClient<SyncRulesBucketStorageListener>,
     SyncStorageWriteCheckpointAPI {
-  readonly group_id: number;
-  readonly slot_name: string;
+  readonly replicationStreamId: number;
+  readonly replicationStreamName: string;
   readonly storageConfig: StorageVersionConfig;
 
   readonly factory: BucketStorageFactory;
   readonly logger: Logger;
 
   /**
-   * Create a new writer.
+   * Create a writer for a source-specific unit of replication work.
    *
-   * The writer must be flushed and disposed when done.
+   * The writer may be used for a long-running streaming attempt, a table
+   * snapshot, a page of snapshot work, or a short setup step. Pending work
+   * that should be persisted must be flushed, committed, or kept alive at the
+   * appropriate source boundary before the writer is disposed.
    */
   createWriter(options: CreateWriterOptions): Promise<BucketStorageBatch>;
 
   /**
+   * Callback wrapper around `createWriter()`.
+   *
    * @deprecated Use `createWriter()` with `await using` instead.
    */
   startBatch(
@@ -44,7 +56,20 @@ export interface SyncRulesBucketStorage
     callback: (batch: BucketStorageBatch) => Promise<void>
   ): Promise<FlushedResult | null>;
 
-  getParsedSyncRules(options: ParseSyncRulesOptions): HydratedSyncConfig;
+  /**
+   * Get the canonical parsed sync config set for the given parse options.
+   *
+   * Repeated calls with the same options return the same instance for the lifetime of
+   * this storage instance. This is the identity boundary for parsed sync config state:
+   * all operations against this storage instance must use parsed objects from sets
+   * returned here, never from an independent parse of the same content.
+   */
+  getParsedSyncConfigSet(options: ParseSyncConfigOptions): ParsedSyncConfigSet;
+
+  /**
+   * Shortcut for `getParsedSyncConfigSet(options).hydratedSyncConfig`.
+   */
+  getParsedSyncRules(options: ParseSyncConfigOptions): HydratedSyncConfig;
 
   /**
    * Terminate the replication stream.
@@ -55,7 +80,7 @@ export interface SyncRulesBucketStorage
    */
   terminate(options?: TerminateOptions): Promise<void>;
 
-  getStatus(): Promise<SyncRuleStatus>;
+  getStatus(): Promise<ReplicationStreamStatus>;
 
   /**
    * Clear the storage, without changing state.
@@ -72,12 +97,20 @@ export interface SyncRulesBucketStorage
    */
   reportError(e: any): Promise<void>;
 
+  /**
+   * Whether parameter compaction can run when {@link CompactOptions.incrementalOnly} is set.
+   *
+   * Storage implementations that do not support incremental parameter compaction must return
+   * false; the compact command will skip parameter compaction in that mode.
+   */
+  supportsIncrementalParameterCompaction(): boolean;
+
   compact(options?: CompactOptions): Promise<void>;
 
   /**
-   * Lightweight "compact" process to populate the checksum cache, if any.
+   * Compact storage after initial replication, before the first checkpoint exists.
    */
-  populatePersistentChecksumCache(options: PopulateChecksumCacheOptions): Promise<PopulateChecksumCacheResults>;
+  compactInitialReplication(options: CompactInitialReplicationOptions): Promise<CompactInitialReplicationResults>;
 
   // ## Read operations
 
@@ -89,7 +122,7 @@ export interface SyncRulesBucketStorage
    *
    * This is a best-effort optimization:
    * 1. This may include more changes than what actually occurred.
-   * 2. This may return invalidateDataBuckets or invalidateParameterBuckets instead of of returning
+   * 2. This may return invalidateDataBuckets or invalidateParameterBuckets instead of returning
    *    specific changes.
    * @param options
    */
@@ -109,15 +142,22 @@ export interface SyncRulesBucketStorage
    * 1. Separate buckets.
    * 2. Limit the size of each individual chunk according to options.batchSizeLimitBytes.
    *
+   * The batch may not contain all data for the checkpoint, if the checkpoint is large. The caller must
+   * continue querying if either:
+   * 1. The last chunk for any bucket has has_more = true.
+   * 2. A SyncBucketDataBatchEnd is returned with hasMore = true.
+   *
+   * The first check can be skipped if a SyncBucketDataBatchEnd is returned with hasMore = false.
+   *
    * @param checkpoint the checkpoint
    * @param dataBuckets current bucket states
    * @param options batch size options
    */
   getBucketDataBatch(
-    checkpoint: util.InternalOpId,
+    checkpoint: ReplicationCheckpoint,
     dataBuckets: BucketDataRequest[],
     options?: BucketDataBatchOptions
-  ): AsyncIterable<SyncBucketDataChunk>;
+  ): AsyncIterable<SyncBucketDataChunk | SyncBucketDataBatchEnd>;
 
   /**
    * Compute checksums for a given list of buckets.
@@ -127,12 +167,22 @@ export interface SyncRulesBucketStorage
    * This may be slow, depending on the size of the buckets.
    * The checksums are cached internally to compensate for this, but does not cover all cases.
    */
-  getChecksums(checkpoint: util.InternalOpId, buckets: BucketChecksumRequest[]): Promise<util.ChecksumMap>;
+  getChecksums(
+    checkpoint: ReplicationCheckpoint,
+    buckets: BucketChecksumRequest[],
+    options?: BucketChecksumOptions
+  ): Promise<util.ChecksumMap>;
 
   /**
    * Clear checksum cache. Primarily intended for tests.
    */
   clearChecksumCache(): void;
+
+  /**
+   * Optional storage-provider cleanup for sync configs that have been stopped
+   * inside this replication stream.
+   */
+  cleanupStoppedSyncConfigs?(options: CleanupStoppedSyncConfigsOptions): Promise<CleanupStoppedSyncConfigsResult>;
 }
 
 export interface SyncRulesBucketStorageListener {
@@ -149,35 +199,61 @@ export interface BucketChecksumRequest {
   source: BucketDataSource;
 }
 
-export interface SyncRuleStatus {
-  checkpoint_lsn: string | null;
-  active: boolean;
-  snapshot_done: boolean;
-  snapshot_lsn: string | null;
+export interface BucketChecksumOptions {
+  requestHint?: BucketRequestHint;
+}
+
+export type BucketRequestHint = 'bulk' | 'incremental';
+
+export interface ReplicationStreamStatus {
   /**
-   * Last persisted operation that must be included in the next checkpoint once checkpointing is unblocked.
+   * Source position to resume replication from.
    */
-  keepalive_op: util.InternalOpId | null;
+  resumeLsn: string | null;
+  /**
+   * True if _every_ active/processing sync config has a client-visible checkpoint.
+   */
+  snapshotDone: boolean;
 }
 export interface ResolveTablesOptions {
   connection_id: number;
+  /**
+   * Source table or collection metadata discovered during snapshot or streaming.
+   */
   source: SourceEntityDescriptor;
+  /**
+   * Classifies overlapping persisted tables. Defaults to identity-based reconciliation.
+   * This may run inside a storage transaction and must not mutate storage.
+   */
+  reconcileSourceTables?: SourceTableCandidateReconciler;
   /**
    * For tests only - custom id generator for stable ids.
    */
   idGenerator?: () => string | bson.ObjectId;
   /**
-   * For tests only - override the sync rules used.
+   * For tests only - override the parsed sync config set used.
    */
-  syncRules?: HydratedSyncConfig;
+  parsedSyncConfig?: ParsedSyncConfigSet;
 }
 
 export interface ResolveTablesResult {
+  /**
+   * Current source table mappings that should receive replicated data.
+   */
   tables: SourceTable[];
+  /**
+   * Outdated source table mappings that should be removed by the connector.
+   */
   dropTables: SourceTable[];
 }
 
-export interface CreateWriterOptions extends ParseSyncRulesOptions {
+/**
+ * Options for creating a storage writer.
+ */
+export interface CreateWriterOptions extends ParseSyncConfigOptions {
+  /**
+   * Source-specific zero or empty replication position.
+   */
   zeroLSN: string;
   /**
    * Whether or not to store a copy of the current data.
@@ -209,6 +285,14 @@ export interface CreateWriterOptions extends ParseSyncRulesOptions {
   tracer?: PerformanceTracer<'storage' | 'evaluate'>;
 
   logger?: Logger;
+
+  /**
+   * Aborts long-running storage work started by this writer, such as uploads to object storage.
+   *
+   * This does not replace flushing or committing at the appropriate source boundary: it only
+   * cancels work that is still in flight when replication stops.
+   */
+  signal?: AbortSignal;
 }
 
 export interface StorageHooks {
@@ -253,6 +337,22 @@ export interface CompactOptions {
 
   compactParameterData?: boolean;
 
+  /**
+   * Only perform compaction that can be done incrementally.
+   *
+   * This includes full bucket compaction on MongoDB V3 storage.
+   *
+   * On MongoDB v1 and Postgres storage, this makes compacting a no-op.
+   */
+  incrementalOnly?: boolean;
+
+  /**
+   * Delete client-requested write checkpoints created before this time.
+   *
+   * Generated write checkpoints are not affected.
+   */
+  deleteCheckpointRequestsBefore?: Date;
+
   /** Minimum of 2 */
   clearBatchLimit?: number;
 
@@ -261,6 +361,9 @@ export interface CompactOptions {
 
   /** Minimum of 1 */
   moveBatchQueryLimit?: number;
+
+  /** Byte cap per read batch for streaming compaction. Default 16MB. */
+  moveBatchByteLimit?: number;
 
   /**
    * Minimum number new operations in a bucket to trigger compaction of that bucket.
@@ -276,6 +379,18 @@ export interface CompactOptions {
    */
   minChangeRatio?: number;
 
+  /** Minimum delay before a V3 bucket is checked for chunk compaction. Default: five minutes. */
+  minCompactChunkIntervalMs?: number;
+
+  /** Minimum elapsed write pressure before the v3 sliding-scale full compact. Default: two hours. */
+  minCompactFullIntervalMs?: number;
+
+  /** Maximum age of writes not covered by a v3 full compact. */
+  maxCompactFullIntervalMs?: number;
+
+  /** How long a v3 worker owns a claimed bucket before another worker may recover it. */
+  compactLeaseDurationMs?: number;
+
   /**
    * Internal/testing use: Cache size for compacting parameters.
    */
@@ -286,21 +401,48 @@ export interface CompactOptions {
   logger?: Logger;
 }
 
-export interface PopulateChecksumCacheOptions {
-  maxOpId: util.InternalOpId;
+export interface CompactInitialReplicationOptions {
+  /** Internal/testing use: bypass the new-chunk threshold in MongoDB V3/V4 storage. */
+  forceChunkCompaction?: boolean;
+  /**
+   * Compact data up to this op id.
+   *
+   * Defaults to the highest persisted op id for the replication stream, which covers
+   * the common case of compacting right after initial replication, before
+   * the first checkpoint exists.
+   */
+  maxOpId?: util.InternalOpId;
   minBucketChanges?: number;
   signal?: AbortSignal;
 }
 
-export interface PopulateChecksumCacheResults {
+export interface CompactInitialReplicationResults {
   /**
-   * Number of buckets we have calculated checksums for.
+   * Number of buckets processed.
    */
   buckets: number;
 }
 
 export interface ClearStorageOptions {
   signal?: AbortSignal;
+}
+
+export interface CleanupStoppedSyncConfigsOptions {
+  signal?: AbortSignal;
+  logger?: Logger;
+  defaultSchema: string;
+  sourceConnectionTag: string;
+}
+
+export interface CleanupStoppedSyncConfigsResult {
+  stoppedSyncConfigsRemoved: number;
+  bucketDataCollectionsDropped: number;
+  parameterIndexCollectionsDropped: number;
+  /** Best-effort number, not accurate if the operation takes longer than the timeout. */
+  bucketStateDocumentsDeleted: number;
+  sourceRecordCollectionsDropped: number;
+  sourceTablesUpdated: number;
+  sourceTablesDeleted: number;
 }
 
 export interface TerminateOptions extends ClearStorageOptions {
@@ -311,6 +453,14 @@ export interface TerminateOptions extends ClearStorageOptions {
 }
 
 export interface BucketDataBatchOptions {
+  requestHint?: BucketRequestHint;
+
+  /** Abort any in-progress work for this batch, including object-storage downloads. */
+  signal?: AbortSignal;
+
+  /** Traces data reads performed by the storage implementation. */
+  tracer?: PerformanceTracer<string>;
+
   /** Limit number of documents returned. Defaults to 1000. */
   limit?: number;
 
@@ -329,6 +479,20 @@ export interface BucketDataBatchOptions {
 export interface SyncBucketDataChunk {
   chunkData: util.SyncBucketData;
   targetOp: util.InternalOpId | null;
+}
+
+export interface SyncBucketDataBatchEnd {
+  /**
+   * True if there may be more data for this checkpoint, and the caller should continue querying.
+   *
+   * This is different from `SyncBucketDataChunk.has_more`, which is per-bucket. This is a global signal for the
+   * entire request, and may be true even if there is no returned chunk with has_more: true.
+   */
+  hasMore: boolean;
+}
+
+export function isBatchEnd(chunk: SyncBucketDataChunk | SyncBucketDataBatchEnd): chunk is SyncBucketDataBatchEnd {
+  return (chunk as SyncBucketDataBatchEnd).hasMore !== undefined;
 }
 
 export interface ReplicationCheckpoint {

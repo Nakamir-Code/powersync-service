@@ -8,6 +8,7 @@ import {
   EvaluationError,
   GetBucketParameterQuerierResult,
   GetQuerierOptions,
+  HydratedEventDescriptor,
   HydrateSyncConfigParams,
   HydrationInput,
   isEvaluatedParameters,
@@ -21,14 +22,15 @@ import {
   QuerierError,
   ScopedEvaluateParameterRow,
   ScopedEvaluateRow,
-  SqlEventDescriptor,
   SqliteInputValue,
   SqliteValue,
   SyncConfig,
   TablePattern
 } from './index.js';
+import { SourceTableConfigMap } from './SourceTableConfig.js';
 import { SourceTableRef, sourceTableRefKey } from './SourceTableRef.js';
 import { createScalarExpressionEngine } from './sync_plan/engine/factory.js';
+import { PrecompiledSyncConfig } from './sync_plan/evaluator/index.js';
 import { EvaluatedParametersResult, EvaluateRowOptions, EvaluationResult, SqliteRow } from './types.js';
 import { applyRowContext, uniqueBy } from './utils.js';
 
@@ -47,12 +49,21 @@ export interface MatchingSources {
  * The persisted state specifically affects bucket names, as well as V3+ storage structure.
  */
 export class HydratedSyncConfig {
+  readonly sourceTableConfig: SourceTableConfigMap;
   /**
    * These are used by queriers, and do not support merging across multiple SyncConfigs.
    */
   private bucketSources: HydratedBucketSource[] = [];
 
-  eventDescriptors: SqlEventDescriptor[] = [];
+  eventDescriptors: HydratedEventDescriptor[] = [];
+
+  /**
+   * Hydrated events grouped by their source definition.
+   *
+   * Deduplication of events across definitions is left to the caller (storage resolves each event to its
+   * per-config assigned id and dedupes on that), so this keeps every definition's events intact for that.
+   */
+  readonly eventDescriptorsByDefinition = new Map<SyncConfig, HydratedEventDescriptor[]>();
 
   /**
    * Only a single compatibility context is supported across all merged SyncConfigs.
@@ -93,9 +104,13 @@ export class HydratedSyncConfig {
     const hydrationState = params.createParams.hydrationState;
     const definitions = params.definitions;
     if (definitions.length == 0) {
-      throw new Error('HydratedSyncRules requires at least one SyncConfig definition');
+      throw new Error('HydratedSyncConfig requires at least one SyncConfig definition');
     }
 
+    // The service validates that definitions sharing a source reader have compatible source-table options.
+    const firstConfig = definitions[0];
+    this.sourceTableConfig =
+      firstConfig instanceof PrecompiledSyncConfig ? (firstConfig.plan.sourceTableConfig ?? {}) : {};
     this.sourceDefinitions = [...definitions];
     this.compatibility = assertSharedCompatibility(this.sourceDefinitions);
     this.hydrationInput = {
@@ -118,7 +133,11 @@ export class HydratedSyncConfig {
       this.bucketParameterLookupSources
     ).evaluateParameterRow;
 
-    this.eventDescriptors = definitions.flatMap((definition) => definition.eventDescriptors);
+    this.eventDescriptors = definitions.flatMap((definition) => {
+      const events = definition.eventDefinitions.map((event) => event.createEvaluator(this.hydrationInput));
+      this.eventDescriptorsByDefinition.set(definition, events);
+      return events;
+    });
 
     if (definitions.length == 1) {
       this.#bucketSourceDefinitions = definitions[0].bucketSources;
@@ -276,7 +295,7 @@ export class HydratedSyncConfig {
   private assertSingleSourceDefinition(debugName: string) {
     // We may split the types in the future to enforce this on a type level instead of runtime level
     if (this.sourceDefinitions.length != 1) {
-      throw new Error(`${debugName} is not supported for HydratedSyncRules with multiple SyncConfigs`);
+      throw new Error(`${debugName} is not supported for HydratedSyncConfig with multiple SyncConfigs`);
     }
   }
 }
@@ -289,7 +308,7 @@ function assertSharedCompatibility(definitions: SyncConfig[]): CompatibilityCont
 
   for (const definition of definitions) {
     if (!definition.compatibility.equals(compatibility)) {
-      throw new Error('All SyncConfigs in a HydratedSyncRules instance must use the same CompatibilityContext');
+      throw new Error('All SyncConfigs in a HydratedSyncConfig instance must use the same CompatibilityContext');
     }
   }
 

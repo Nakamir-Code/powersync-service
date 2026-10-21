@@ -1,5 +1,57 @@
 # @powersync/lib-service-mongodb
 
+## 0.6.34
+
+### Patch Changes
+
+- Updated dependencies [44ce423]
+  - @powersync/lib-services-framework@0.10.4
+
+## 0.6.33
+
+### Patch Changes
+
+- @powersync/lib-services-framework@0.10.3
+
+## 0.6.32
+
+### Patch Changes
+
+- @powersync/lib-services-framework@0.10.2
+
+## 0.6.31
+
+### Patch Changes
+
+- @powersync/lib-services-framework@0.10.1
+
+## 0.6.30
+
+### Patch Changes
+
+- 37591e9: [MongoDB Storage] Use batched deletes for clearing data.
+- Updated dependencies [2189250]
+  - @powersync/lib-services-framework@0.10.0
+
+## 0.6.29
+
+### Patch Changes
+
+- @powersync/lib-services-framework@0.9.8
+
+## 0.6.28
+
+### Patch Changes
+
+- e4f683d: [MongoDB Storage] Add experimental option to allow reading data from secondaries.
+  - @powersync/lib-services-framework@0.9.7
+
+## 0.6.27
+
+### Patch Changes
+
+- @powersync/lib-services-framework@0.9.6
+
 ## 0.6.26
 
 ### Patch Changes

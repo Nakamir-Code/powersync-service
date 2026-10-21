@@ -1,8 +1,39 @@
-import { acquireSemaphoreAbortable } from '@/index.js';
+import { acquireSemaphoreAbortable, isAbortError } from '@/index.js';
 import { Semaphore, SemaphoreInterface } from 'async-mutex';
+import { AbortError } from 'ix/aborterror.js';
 import { describe, expect, test, vi } from 'vitest';
 
+describe('isAbortError', () => {
+  test('recognizes ix and native abort errors', () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    expect(isAbortError(new AbortError())).toBe(true);
+    expect(isAbortError(controller.signal.reason)).toBe(true);
+    expect(isAbortError(new Error('not aborted'))).toBe(false);
+  });
+});
+
 describe('acquireSemaphoreAbortable', () => {
+  test('waits for an available slot without a signal', async () => {
+    const semaphore = new Semaphore(1);
+    const [, release] = await semaphore.acquire();
+    const resolved = vi.fn();
+    const waiting = acquireSemaphoreAbortable(semaphore).then((result) => {
+      resolved();
+      return result;
+    });
+    await Promise.resolve();
+    expect(resolved).not.toHaveBeenCalled();
+
+    release();
+    const acquired = await waiting;
+    expect(acquired).not.toBe('aborted');
+    expect(semaphore.getValue()).toBe(0);
+    (acquired as [number, SemaphoreInterface.Releaser])[1]();
+    expect(semaphore.getValue()).toBe(1);
+  });
+
   test('can acquire', async () => {
     const semaphore = new Semaphore(1);
     const controller = new AbortController();
@@ -29,6 +60,21 @@ describe('acquireSemaphoreAbortable', () => {
     expect(resolve).toHaveBeenCalledWith('aborted');
 
     // Releasing the semaphore should not invoke resolve again
+    release();
+  });
+
+  test('does not wait when the signal is already aborted', async () => {
+    const semaphore = new Semaphore(1);
+    const controller = new AbortController();
+
+    // Hold the only slot, so acquiring would block indefinitely.
+    const result = await acquireSemaphoreAbortable(semaphore, controller.signal);
+    expect(result).not.toBe('aborted');
+    const [, release] = result as [number, SemaphoreInterface.Releaser];
+
+    controller.abort();
+    expect(await acquireSemaphoreAbortable(semaphore, controller.signal)).toBe('aborted');
+
     release();
   });
 });

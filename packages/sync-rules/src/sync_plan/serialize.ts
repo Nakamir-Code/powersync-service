@@ -1,17 +1,21 @@
 import { ParameterLookupDefinitionId } from '../HydrationState.js';
-import { ImplicitSchemaTablePattern, TablePattern } from '../TablePattern.js';
+import { normalizeSourceTableConfig, SourceTableConfigMap } from '../SourceTableConfig.js';
+import { DEFAULT_TAG, ImplicitSchemaTablePattern, TablePattern } from '../TablePattern.js';
 import { SqlExpression } from './expression.js';
 import { MapSourceVisitor, visitExpr } from './expression_visitor.js';
 import {
   ColumnSource,
   ColumnSqlParameterValue,
+  CompiledEventDescriptor,
   CompiledSyncStream,
   EvaluateTableValuedFunction,
+  EventRowEvaluator,
   ExpandingLookup,
   ParameterLookup,
   ParameterValue,
   PartitionKey,
   RequestSqlParameterValue,
+  RowMetadataSqlValue,
   StreamBucketDataSource,
   StreamDataSource,
   StreamOptions,
@@ -24,24 +28,16 @@ import {
   TableProcessorTableValuedFunctionOutput
 } from './plan.js';
 
-/**
- * Serializes a sync plan into a simple JSON object.
- *
- * While {@link SyncPlan}s are already serializable for the most part, it contains a graph of references from e.g.
- * queriers to bucket creators. To represent this efficiently, we assign numbers to referenced elements while
- * serializing instead of duplicating definitions.
- */
-export function serializeSyncPlan(plan: SyncPlan): SerializedSyncPlanV1 {
-  const dataSourceIndex = new Map<StreamDataSource, number>();
-  const bucketIndex = new Map<StreamBucketDataSource, number>();
-  const parameterIndex = new Map<StreamParameterIndexLookupCreator, number>();
-  const expandingLookups = new Map<ExpandingLookup, LookupReference>();
+function createTableProcessorSerializer() {
   const addedTableValuedFunctions = new Map<TableProcessorTableValuedFunction, number>();
+  let usesRowMetadataSqlValue = false;
 
   const replaceFunctionReferenceWithIndex = new MapSourceVisitor<
-    ColumnSqlParameterValue | TableProcessorTableValuedFunctionOutput,
-    ColumnSqlParameterValue | SerializedTableProcessorTableValuedFunctionOutput
+    ColumnSqlParameterValue | RowMetadataSqlValue | TableProcessorTableValuedFunctionOutput,
+    ColumnSqlParameterValue | RowMetadataSqlValue | SerializedTableProcessorTableValuedFunctionOutput
   >((value) => {
+    usesRowMetadataSqlValue ||= 'metadata' in value;
+
     if ('function' in value) {
       return { function: addedTableValuedFunctions.get(value.function)!, outputName: value.outputName };
     } else {
@@ -66,7 +62,15 @@ export function serializeSyncPlan(plan: SyncPlan): SerializedSyncPlanV1 {
   function serializeTableValued(source: TableProcessor): TableProcessorTableValuedFunction[] {
     return source.tableValuedFunctions.map((fn, i) => {
       addedTableValuedFunctions.set(fn, i);
-      return fn;
+
+      return {
+        functionName: fn.functionName,
+        functionInputs: fn.functionInputs.map(
+          // Since we don't support table-valued functions as inputs to other table-valued functions, this doesn't
+          // change expressions. It ensures we track row metadata use in any input, though.
+          (s) => serializeTableProcessorDataExpr(s) as SqlExpression<ColumnSqlParameterValue>
+        )
+      };
     });
   }
 
@@ -75,6 +79,62 @@ export function serializeSyncPlan(plan: SyncPlan): SerializedSyncPlanV1 {
       return { expr: serializeTableProcessorDataExpr(key.expr) };
     });
   }
+
+  function serializeEventRowEvaluator(source: EventRowEvaluator): SerializedEventRowEvaluator {
+    return {
+      hash: source.hashCode,
+      table: serializeTablePattern(source.sourceTable),
+      tableValuedFunctions: serializeTableValued(source),
+      filters: source.filters.map(serializeTableProcessorDataExpr),
+      partitionBy: translateParameters(source),
+      columns: source.columns.map((column): SerializedColumnSource => {
+        if (column == 'star') {
+          return 'star';
+        }
+
+        return { expr: serializeTableProcessorDataExpr(column.expr), alias: column.alias };
+      })
+    };
+  }
+
+  function serializeEventDefinition(event: CompiledEventDescriptor): SerializedEventDescriptor {
+    return {
+      name: event.name,
+      sourceQueries: event.sourceQueries.map((query) => ({
+        sql: query.sql,
+        table: serializeTablePattern(query.sourceTable),
+        variants: query.variants.map(serializeEventRowEvaluator)
+      }))
+    };
+  }
+
+  return {
+    get usesRowMetadataSqlValue() {
+      return usesRowMetadataSqlValue;
+    },
+    serializeTableProcessorDataExpr,
+    serializeTablePattern,
+    serializeTableValued,
+    translateParameters,
+    serializeEventDefinition
+  };
+}
+
+/**
+ * Serializes a sync plan into a simple JSON object.
+ *
+ * While {@link SyncPlan}s are already serializable for the most part, it contains a graph of references from e.g.
+ * queriers to bucket creators. To represent this efficiently, we assign numbers to referenced elements while
+ * serializing instead of duplicating definitions.
+ */
+export function serializeSyncPlan(plan: SyncPlan): SerializedSyncPlan {
+  const dataSourceIndex = new Map<StreamDataSource, number>();
+  const bucketIndex = new Map<StreamBucketDataSource, number>();
+  const parameterIndex = new Map<StreamParameterIndexLookupCreator, number>();
+  const expandingLookups = new Map<ExpandingLookup, LookupReference>();
+  const tableProcessorSerializer = createTableProcessorSerializer();
+  const { serializeTableProcessorDataExpr, serializeTablePattern, serializeTableValued, translateParameters } =
+    tableProcessorSerializer;
 
   function serializeDataSources(): SerializedDataSource[] {
     return plan.dataSources.map((source, i) => {
@@ -108,7 +168,7 @@ export function serializeSyncPlan(plan: SyncPlan): SerializedSyncPlanV1 {
         tableValuedFunctions: serializeTableValued(source),
         filters: source.filters.map(serializeTableProcessorDataExpr),
         partitionBy: translateParameters(source),
-        output: source.outputs.map((out) => visitExpr(replaceFunctionReferenceWithIndex, out, null)),
+        output: source.outputs.map(serializeTableProcessorDataExpr),
         lookupScope: source.defaultLookupScope
       } satisfies SerializedParameterIndexLookupCreator;
     });
@@ -166,8 +226,9 @@ export function serializeSyncPlan(plan: SyncPlan): SerializedSyncPlanV1 {
     };
   }
 
-  return {
-    version: 1,
+  const events = plan.events.map(tableProcessorSerializer.serializeEventDefinition);
+  const sourceTableConfig = normalizeSourceTableConfig(plan.sourceTableConfig);
+  const serialized: SerializedSyncPlan = {
     dataSources: serializeDataSources(),
     buckets: plan.buckets.map((bkt, index) => {
       bucketIndex.set(bkt, index);
@@ -181,18 +242,34 @@ export function serializeSyncPlan(plan: SyncPlan): SerializedSyncPlanV1 {
     streams: plan.streams.map((s) => ({
       stream: s.stream,
       queriers: s.queriers.map(serializeStreamQuerier)
-    }))
+    })),
+    version: Object.keys(sourceTableConfig).length != 0 ? 3 : tableProcessorSerializer.usesRowMetadataSqlValue ? 2 : 1
   };
+
+  // Compiled events are intentionally additive to plan versions 1 and 2. The service also persists their raw SQL in
+  // the legacy eventDescriptors field, so older readers can ignore this field and retain equivalent event behavior.
+  if (events.length != 0) {
+    serialized.events = events;
+  }
+
+  if (Object.keys(sourceTableConfig).length != 0) serialized.sourceTableConfig = sourceTableConfig;
+  return serialized;
 }
 
 export function deserializeSyncPlan(serialized: unknown): SyncPlan {
-  if ((serialized as SerializedSyncPlanV1).version != 1) {
+  const { version } = serialized as SerializedSyncPlan;
+  if (version > maxSupportedSyncPlanVersion) {
+    throw new Error(
+      `Encountered a sync plan with version ${version}, the maximum supported version is ${maxSupportedSyncPlanVersion}. This can happen when the PowerSync service version is downgraded after deploying Sync Streams, consider upgrading or re-deploying.`
+    );
+  }
+  if (version !== 1 && version !== 2 && version !== 3) {
     throw new Error('Unknown sync plan version passed to deserializeSyncPlan()');
   }
 
   function deserializeTablePattern(pattern: SerializedTablePattern): ImplicitSchemaTablePattern {
     if (pattern.schema) {
-      return new TablePattern(`${pattern.connection}.${pattern.schema}`, pattern.table);
+      return new TablePattern(pattern.schema, pattern.table, pattern.connection ?? DEFAULT_TAG);
     } else {
       return new ImplicitSchemaTablePattern(null, pattern.table);
     }
@@ -201,8 +278,8 @@ export function deserializeSyncPlan(serialized: unknown): SyncPlan {
   let tableValuedFunctionsInScope: TableProcessorTableValuedFunction[] = [];
 
   const replaceFunctionIndexWithReference = new MapSourceVisitor<
-    ColumnSqlParameterValue | SerializedTableProcessorTableValuedFunctionOutput,
-    ColumnSqlParameterValue | TableProcessorTableValuedFunctionOutput
+    ColumnSqlParameterValue | RowMetadataSqlValue | SerializedTableProcessorTableValuedFunctionOutput,
+    ColumnSqlParameterValue | RowMetadataSqlValue | TableProcessorTableValuedFunctionOutput
   >((value) => {
     if ('function' in value) {
       return { function: tableValuedFunctionsInScope[value.function], outputName: value.outputName };
@@ -223,7 +300,11 @@ export function deserializeSyncPlan(serialized: unknown): SyncPlan {
     });
   }
 
-  const plan = serialized as SerializedSyncPlanV1;
+  const plan = serialized as SerializedSyncPlan;
+  const sourceTableConfig = normalizeSourceTableConfig(plan.sourceTableConfig);
+  if (Object.keys(sourceTableConfig).length != 0 && plan.version != 3) {
+    throw new Error('Source table configuration requires sync plan version 3.');
+  }
   const dataSources = plan.dataSources.map((source): StreamDataSource => {
     const functions = (tableValuedFunctionsInScope = source.tableValuedFunctions);
 
@@ -261,6 +342,40 @@ export function deserializeSyncPlan(serialized: unknown): SyncPlan {
       parameters: deserializeParameters(source.partitionBy),
       outputs: source.output.map((out) => visitExpr(replaceFunctionIndexWithReference, out, null)),
       defaultLookupScope: source.lookupScope
+    };
+  });
+
+  function deserializeEventRowEvaluator(source: SerializedEventRowEvaluator): EventRowEvaluator {
+    const functions = (tableValuedFunctionsInScope = source.tableValuedFunctions);
+
+    return {
+      hashCode: source.hash,
+      sourceTable: deserializeTablePattern(source.table),
+      tableValuedFunctions: functions,
+      filters: source.filters.map(deserializeTableProcessorDataExpr),
+      parameters: deserializeParameters(source.partitionBy),
+      columns: source.columns.map((column): ColumnSource => {
+        if (column == 'star') {
+          return 'star';
+        }
+
+        return { expr: deserializeTableProcessorDataExpr(column.expr), alias: column.alias };
+      })
+    };
+  }
+
+  if (plan.events != null && !Array.isArray(plan.events)) {
+    throw new Error('Compiled sync plan events must be an array.');
+  }
+  const serializedEvents = plan.events ?? [];
+  const events = serializedEvents.map((event): CompiledEventDescriptor => {
+    return {
+      name: event.name,
+      sourceQueries: event.sourceQueries.map((query) => ({
+        sql: query.sql,
+        sourceTable: deserializeTablePattern(query.table),
+        variants: query.variants.map(deserializeEventRowEvaluator)
+      }))
     };
   });
 
@@ -328,44 +443,85 @@ export function deserializeSyncPlan(serialized: unknown): SyncPlan {
     dataSources,
     buckets,
     parameterIndexes,
-    streams
+    streams,
+    events,
+    ...(Object.keys(sourceTableConfig).length != 0 && { sourceTableConfig })
   };
 }
 
-interface SerializedSyncPlanV1 {
-  version: number;
+/**
+ * Changes to {@link SerializedSyncPlan} require a version bump when older services would interpret the plan
+ * incorrectly. Optional additive fields are only safe without a bump when older readers can ignore them while another
+ * persisted representation preserves equivalent behavior.
+ *
+ * Compiled `events` are an explicit additive exception: service-core continues to persist raw event SQL alongside the
+ * plan for the legacy evaluator. Older readers ignore `events` and use that legacy mirror. Removing the mirror or
+ * relying on compiled-only event semantics will require a version bump.
+ *
+ * ### Version 3
+ *
+ * - First-class source-table configuration. Older services must reject plans whose source options they cannot interpret.
+ *
+ * ### Version 2
+ *
+ * - Add {@link RowMetadataSqlValue} to data for row and parameter evaluators, exposing the exact table and schema name
+ *   when matching on wildcard table patterns.
+ *   The deserialization logic can remain the same for v1 and v2.
+ *
+ * ### Version 1
+ *
+ * - Initial version
+ */
+export type SerializedSyncPlanVersion = 1 | 2 | 3;
+
+export const maxSupportedSyncPlanVersion: SerializedSyncPlanVersion = 3;
+
+export interface SerializedSyncPlan {
+  /**
+   * Present only for configured source tables; requires plan version 3.
+   */
+  sourceTableConfig?: SourceTableConfigMap;
+  version: SerializedSyncPlanVersion;
   dataSources: SerializedDataSource[];
   buckets: SerializedBucketDataSource[];
   parameterIndexes: SerializedParameterIndexLookupCreator[];
   streams: SerializedStream[];
+  /**
+   * Optional additive compiled event definitions. Older readers safely ignore this because service-core dual-writes
+   * equivalent raw SQL in its legacy `eventDescriptors` field.
+   */
+  events?: SerializedEventDescriptor[];
 }
 
-interface SerializedBucketDataSource {
+export interface SerializedBucketDataSource {
   hash: number;
   uniqueName: string;
   sources: number[];
 }
 
-interface SerializedTablePattern {
+export interface SerializedTablePattern {
   connection: string | null;
   schema: string | null;
   table: string;
 }
 
-interface SerializedTableProcessorTableValuedFunctionOutput {
+export interface SerializedTableProcessorTableValuedFunctionOutput {
   function: number;
   outputName: string;
 }
 
-type SerializedTableProcessorData = ColumnSqlParameterValue | SerializedTableProcessorTableValuedFunctionOutput;
+export type SerializedTableProcessorData =
+  | ColumnSqlParameterValue
+  | RowMetadataSqlValue
+  | SerializedTableProcessorTableValuedFunctionOutput;
 
-interface SerializedPartitionKey {
+export interface SerializedPartitionKey {
   expr: SqlExpression<SerializedTableProcessorData>;
 }
 
-type SerializedColumnSource = 'star' | { expr: SqlExpression<SerializedTableProcessorData>; alias: string };
+export type SerializedColumnSource = 'star' | { expr: SqlExpression<SerializedTableProcessorData>; alias: string };
 
-interface SerializedDataSource {
+export interface SerializedDataSource {
   table: SerializedTablePattern;
   outputTableName?: string;
   hash: number;
@@ -375,7 +531,35 @@ interface SerializedDataSource {
   partitionBy: SerializedPartitionKey[];
 }
 
-interface SerializedParameterIndexLookupCreator {
+export interface SerializedEventDescriptor {
+  name: string;
+  sourceQueries: SerializedEventSourceQuery[];
+}
+
+export interface SerializedEventSourceQuery {
+  /**
+   * Raw SQL retained for the legacy compatibility mirror.
+   */
+  sql: string;
+  table: SerializedTablePattern;
+  variants: SerializedEventRowEvaluator[];
+}
+
+export interface SerializedEventRowEvaluator {
+  table: SerializedTablePattern;
+  /**
+   * The compiler's structural hash, retained only for round-trip symmetry with data sources (which reuse the same
+   * projection shape). It is not part of event identity (the compiler model compares behavior directly), and events
+   * are never deduplicated by it at runtime.
+   */
+  hash: number;
+  columns: SerializedColumnSource[];
+  filters: SqlExpression<SerializedTableProcessorData>[];
+  tableValuedFunctions: TableProcessorTableValuedFunction[];
+  partitionBy: SerializedPartitionKey[];
+}
+
+export interface SerializedParameterIndexLookupCreator {
   table: SerializedTablePattern;
   hash: number;
   lookupScope: ParameterLookupDefinitionId;
@@ -385,19 +569,19 @@ interface SerializedParameterIndexLookupCreator {
   partitionBy: SerializedPartitionKey[];
 }
 
-interface SerializedStream {
+export interface SerializedStream {
   stream: StreamOptions;
   queriers: SerializedStreamQuerier[];
 }
 
-interface SerializedStreamQuerier {
+export interface SerializedStreamQuerier {
   requestFilters: SqlExpression<RequestSqlParameterValue>[];
   lookupStages: SerializedExpandingLookup[][];
   bucket: number;
   sourceInstantiation: SerializedParameterValue[];
 }
 
-type SerializedExpandingLookup =
+export type SerializedExpandingLookup =
   | {
       type: 'parameter';
       lookup: number;
@@ -411,12 +595,12 @@ type SerializedExpandingLookup =
       filters: SqlExpression<ColumnSqlParameterValue>[];
     };
 
-interface LookupReference {
+export interface LookupReference {
   stageId: number;
   idInStage: number;
 }
 
-type SerializedParameterValue =
+export type SerializedParameterValue =
   | { type: 'request'; expr: SqlExpression<RequestSqlParameterValue> }
   | { type: 'lookup'; lookup: LookupReference; resultIndex: number }
   | { type: 'intersection'; values: SerializedParameterValue[] };

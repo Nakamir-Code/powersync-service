@@ -1,5 +1,6 @@
 import { BucketPriority } from '../BucketDescription.js';
 import { ParameterLookupDefinitionId } from '../HydrationState.js';
+import type { SourceTableConfigMap } from '../SourceTableConfig.js';
 import { ImplicitSchemaTablePattern } from '../TablePattern.js';
 import { UnscopedEvaluatedParameters } from '../types.js';
 import { SqlExpression } from './expression.js';
@@ -11,7 +12,7 @@ import { SqlExpression } from './expression.js';
  *   2. how rows get filtered, mapped and put into parameter lookups.
  *   3. how connections use parameter lookups to infer buckets.
  *
- * Sync plans can be compiled from sync stream definitions. There is always a single plan for all stream definitions,
+ * Sync plans can be compiled from Sync Stream definitions. There is always a single plan for all stream definitions,
  * which allows re-using parameter lookups if multiple streams have similar subpatterns.
  *
  * Additionally, sync plans can be serialized to (and restored from) a simple JSON representation. We store sync plans
@@ -22,10 +23,12 @@ import { SqlExpression } from './expression.js';
  * but we must never alter the semantics for existing serialized plans.
  */
 export interface SyncPlan {
+  sourceTableConfig?: SourceTableConfigMap;
   dataSources: StreamDataSource[];
   buckets: StreamBucketDataSource[];
   parameterIndexes: StreamParameterIndexLookupCreator[];
   streams: CompiledSyncStream[];
+  events: CompiledEventDescriptor[];
 }
 
 /**
@@ -94,10 +97,13 @@ export interface TableProcessorTableValuedFunctionOutput {
 /**
  * External data that can be used in expressions for {@link TableProcessor}s.
  *
- * This allows references to the row in the table being processed, and references to outputs of joined
- * {@link TableProcessor#tableValuedFunctions}.
+ * This allows references to the row in the table being processed, metadata about the row's source table, and
+ * references to outputs of joined {@link TableProcessor#tableValuedFunctions}.
  */
-export type TableProcessorData = ColumnSqlParameterValue | TableProcessorTableValuedFunctionOutput;
+export type TableProcessorData =
+  | ColumnSqlParameterValue
+  | RowMetadataSqlValue
+  | TableProcessorTableValuedFunctionOutput;
 
 /**
  * A scalar partition key evaluates to a single value in the source or parameter row. For instance, a stream definition
@@ -115,21 +121,53 @@ export interface PartitionKey {
  * duplicate bucket data but can still share the actual processing logic between multiple streams (to avoid evaluating
  * the same filters and expressions multiple times).
  */
-export interface StreamDataSource extends TableProcessor {
+export interface RowProjection extends TableProcessor {
+  /**
+   * Output columns produced when a matching source row is evaluated.
+   */
+  columns: ColumnSource[];
+}
+
+export interface StreamDataSource extends RowProjection {
   /**
    * The name of the output table for evaluated rows.
    *
    * If null, the name of the table being evaluated should be used instead.
    */
   outputTableName?: string;
-
-  /**
-   * Output columns describing the row to store in buckets.
-   */
-  columns: ColumnSource[];
 }
 
 export type ColumnSource = 'star' | { expr: SqlExpression<TableProcessorData>; alias: string };
+
+/**
+ * A named replication event compiled from `event_definitions`.
+ */
+export interface CompiledEventDescriptor {
+  name: string;
+  sourceQueries: CompiledEventSourceQuery[];
+}
+
+/**
+ * A single payload query for an event.
+ *
+ * Event payload queries are restricted to one physical source table. A query can have multiple variants after its
+ * filter has been normalized to disjunctive normal form. Evaluation stops after the first matching variant, which may
+ * itself produce multiple payload rows, for example through a table-valued expansion.
+ */
+export interface CompiledEventSourceQuery {
+  /**
+   * Original SQL retained as a compatibility mirror for services using the legacy event evaluator. Compiled event
+   * evaluation uses the remaining fields.
+   */
+  sql: string;
+  sourceTable: ImplicitSchemaTablePattern;
+  variants: EventRowEvaluator[];
+}
+
+/**
+ * A row projection used by one normalized filter variant of an event payload query.
+ */
+export interface EventRowEvaluator extends RowProjection {}
 
 /**
  * A mapping describing how {@link StreamDataSource}s are combined into buckets.
@@ -215,6 +253,17 @@ export interface ColumnSqlParameterValue {
   column: string;
 }
 
+export type RowMetadataKind = 'schema' | 'table_name' | 'table_suffix';
+
+/**
+ * A value that resolves to metadata about the source table of the row being processed: the schema containing the
+ * table (`schema()`), the name of the table (`table_name()`) or, for wildcard table patterns, the matched
+ * suffix of the table name (`table_suffix()`).
+ */
+export interface RowMetadataSqlValue {
+  metadata: RowMetadataKind;
+}
+
 export type ConnectionParameterSource = 'auth' | 'subscription' | 'connection';
 
 /**
@@ -227,6 +276,7 @@ export interface RequestSqlParameterValue {
 
 export type SqlParameterValue =
   | ColumnSqlParameterValue
+  | RowMetadataSqlValue
   | RequestSqlParameterValue
   | TableProcessorTableValuedFunctionOutput;
 

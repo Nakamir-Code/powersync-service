@@ -1,5 +1,83 @@
 # @powersync/lib-service-postgres
 
+## 0.5.7
+
+### Patch Changes
+
+- Updated dependencies [44ce423]
+- Updated dependencies [51a1a89]
+  - @powersync/service-types@0.20.0
+  - @powersync/lib-services-framework@0.10.4
+  - @powersync/service-jpgwire@0.21.26
+
+## 0.5.6
+
+### Patch Changes
+
+- Updated dependencies [5078032]
+  - @powersync/service-types@0.19.0
+  - @powersync/lib-services-framework@0.10.3
+  - @powersync/service-jpgwire@0.21.25
+
+## 0.5.5
+
+### Patch Changes
+
+- @powersync/lib-services-framework@0.10.2
+- @powersync/service-jpgwire@0.21.24
+
+## 0.5.4
+
+### Patch Changes
+
+- 4e4063b: Optimize runtime type checks, closes https://github.com/powersync-ja/powersync-service/issues/771.
+- Updated dependencies [33a3c23]
+- Updated dependencies [fccdff2]
+- Updated dependencies [4e4063b]
+- Updated dependencies [4037e8f]
+  - @powersync/service-types@0.18.0
+  - @powersync/lib-services-framework@0.10.1
+  - @powersync/service-jpgwire@0.21.23
+
+## 0.5.3
+
+### Patch Changes
+
+- 123c801: Reconnect PostgreSQL notification connections and restore `LISTEN` subscriptions when the underlying connection is terminated. Harden connection-slot retries and lease handling, and publish checkpoint notifications atomically with checkpoint updates.
+- Updated dependencies [2189250]
+- Updated dependencies [123c801]
+  - @powersync/lib-services-framework@0.10.0
+  - @powersync/service-types@0.17.0
+  - @powersync/service-jpgwire@0.21.22
+
+## 0.5.2
+
+### Patch Changes
+
+- @powersync/lib-services-framework@0.9.8
+- @powersync/service-jpgwire@0.21.21
+
+## 0.5.1
+
+### Patch Changes
+
+- Updated dependencies [c2edf86]
+  - @powersync/service-types@0.16.1
+  - @powersync/lib-services-framework@0.9.7
+
+## 0.5.0
+
+### Minor Changes
+
+- a91a08f: [Experimental] Enable incremental reprocessing for MongoDB source + MongoDB storage. This includes significant changes to the v3 storage format.
+
+### Patch Changes
+
+- Updated dependencies [a91a08f]
+  - @powersync/service-types@0.16.0
+  - @powersync/lib-services-framework@0.9.6
+  - @powersync/service-jpgwire@0.21.20
+
 ## 0.4.28
 
 ### Patch Changes

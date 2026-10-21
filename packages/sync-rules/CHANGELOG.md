@@ -1,5 +1,117 @@
 # @powersync/service-sync-rules
 
+## 0.44.0
+
+### Minor Changes
+
+- 44ce423: Add `config.source_table_options` to edition 3 sync configs, including MongoDB pre-filtering expressions. Generate editor schemas with examples and report validation errors at their YAML source locations.
+
+  MongoDB replication pre-filtering is not supported in the Open Edition; unsupported configurations report `PSYNC_S1348`. For example:
+
+  ```yaml
+  config:
+    edition: 3
+    source_table_options:
+      orders:
+        mongodb_filter_expression:
+          $and:
+            - $eq: ['$$doc.active', true]
+            - $in: ['$$doc.status', ['pending', 'shipped']]
+  streams:
+    orders:
+      query: SELECT * FROM orders
+  ```
+
+  Validation and deployment reject filters when the feature is unavailable. Parsing accepts an optional map of connection tags to connection types, rejecting MongoDB pre-filtering expressions on known non-MongoDB sources. Unknown connections or missing connection metadata produce advisory warnings. The service supplies connection metadata during validation, deployment, and filesystem loading. Filesystem-loaded sync configs also run source-capability checks. With `exit_on_error` disabled, configs remain available to diagnostics. Changing source-table options requires replacement processing when deploying a new sync config.
+
+  Source capability validation returns structured `ValidationDiagnostic` entries, allowing multiple fatal issues and
+  advisory warnings. Deployment and reprocessing reject fatal diagnostics while validation continues collecting
+  independent findings. Existing `ReplicationError` consumers retain the same diagnostic shape.
+
+### Patch Changes
+
+- e703ca5: Restore `schema/sync_rules.json` file removed in version `0.43.0`.
+- 324093e: Internal refactor to make it clearer how legacy `token_parameters` values are derived.
+- 57ef2f4: Report a non-fatal deprecation warning when a sync config uses legacy Sync Rules (`bucket_definitions:`). It appears in the `/api/admin/v1/diagnostics` and `/api/admin/v1/validate` responses with `level: 'warning'`, and the service now logs sync config errors and warnings when it loads or deploys a sync config.
+- 6700c71: Emit type-only imports for `PowerSyncDatabase` and `SyncStream` in generated TypeScript schemas.
+
+## 0.43.0
+
+### Minor Changes
+
+- 18f0c95: Add `fixed_booleans_in_json` to sync booleans in JSON columns as booleans instead of as 0/1 integer.
+
+### Patch Changes
+
+- 5078032: Change the default MongoDB storage version from 2 to 4.
+- e87703a: Export generated `schema/sync_config.json` file.
+- c60db6e: Mark legacy Sync Rules and the alpha Sync Streams implementation as `@deprecated`, and update the sync-rules README, templates, and examples to document Sync Streams first. Capitalize "Sync Streams" in log and error messages.
+- 0483d4e: Deduplicate inclusion reasons when merging buckets reached through more than one branch (e.g. overlapping subscriptions, or both a static and a dynamic parameter query), avoiding duplicate `subscriptions` entries on the wire.
+
+## 0.42.0
+
+### Minor Changes
+
+- 5ae6f75: Add a schema generator for the Rust SDK.
+
+## 0.41.0
+
+### Minor Changes
+
+- 189bd9e: Add storage_version: 4 as a stable storage version.
+- bb08068: Compile event payload queries into serialized sync plans and evaluate them through the shared row-projection implementation. Existing event deployments use one basic, direct-projection query per physical table; filters and other advanced SQL forms are not currently documented or recommended.
+
+  Edition 3 now validates and applies event `WHERE` clauses. Existing persisted plans and editions 1 and 2 retain the legacy behavior of ignoring filters and emit a warning; deploy a new sync config to enable compiled filtering. Remove event `WHERE` clauses before rolling the service back to an older version.
+
+  Event evaluation now follows sync stream semantics by returning all payloads from matching queries, including overlapping exact and wildcard sources, or no payloads when filters do not match. Payload query order does not affect persisted equality. Compiled `SELECT *` payloads also include underscore-prefixed columns, matching sync streams.
+
+- 646c0de: Track replication events as MongoDB storage v3 source-table memberships so unchanged event definitions retain their assigned ids while new or changed definitions are resnapshotted during incremental reprocessing.
+
+### Patch Changes
+
+- 4b6a23e: Preserve multi-column parameter correlation when a deduplicated lookup is reached through multiple provenance paths.
+- 3972bac: Correctly reuse equivalent Sync Streams query components when independent filters or attached table-valued functions appear in a different order.
+
+## 0.40.0
+
+### Minor Changes
+
+- be42e25: Support wildcard schemas in Sync Streams (e.g. `SELECT * FROM "%".assets`), with the matched schema available as `assets.schema()`, the table name as `assets.table_name()` and the matched wildcard table suffix as `assets.table_suffix()` for use in filters and bucket parameters.
+
+### Patch Changes
+
+- 8daa300: Provide a span for more types of yaml errors when reading Sync Streams.
+- cb4c627: Improve error message when trying to load Sync Streams deployed with a more recent service version on older services.
+
+## 0.39.0
+
+### Minor Changes
+
+- ea71bf3: Stop exporting legacy Sync Rules and alpha Sync Streams implementations
+
+### Patch Changes
+
+- edc6ed4: Emit a warning for Sync Streams with joins where the primary table has an alias. Adding an alias syncs the table under the changed name, which may be unintentional for joins if aliases are only added to simplify filters.
+
+  Closes #565.
+
+## 0.38.1
+
+### Patch Changes
+
+- a6ae678: Warn when using a `*` column in Sync Streams might overwrite an earlier alias.
+
+## 0.38.0
+
+### Minor Changes
+
+- c3f75df: [Internal] Add comparison methods for serialized sync plans.
+
+### Patch Changes
+
+- 184c39f: Make `lower()` and `upper()` Unicode aware even when `unstable_sqlite_expression_engine: true` is enabled.
+- 4bd35ea: Fix error responses when a Sync Stream parameter selects from a table with a wildcard pattern.
+
 ## 0.37.0
 
 ### Minor Changes

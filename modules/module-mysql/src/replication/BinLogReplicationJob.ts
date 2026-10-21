@@ -17,12 +17,14 @@ export class BinLogReplicationJob extends replication.AbstractReplicationJob {
     this.connectionFactory = options.connectionFactory;
   }
 
-  get slot_name() {
-    return this.options.storage.slot_name;
+  get replicationStreamName() {
+    return this.options.storage.replicationStreamName;
   }
 
   async keepAlive() {
-    // Keepalives are handled by the binlog heartbeat mechanism
+    // The binlog connection is kept alive by the MySQL server heartbeat mechanism. The control
+    // connection carries no traffic between metadata queries, so probe its liveness here.
+    this.lastStream?.probeControlConnection();
   }
 
   async replicate() {
@@ -37,7 +39,7 @@ export class BinLogReplicationJob extends replication.AbstractReplicationJob {
         // Report the error if relevant, before retrying
         container.reporter.captureException(e, {
           metadata: {
-            replication_slot: this.slot_name
+            replication_slot: this.replicationStreamName
           }
         });
         // This sets the retry delay

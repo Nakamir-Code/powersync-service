@@ -1,5 +1,135 @@
 # @powersync/service-module-core
 
+## 0.2.37
+
+### Patch Changes
+
+- 286b0f8: Update WebSocket and HTTP dependencies to address reported security vulnerabilities. Update the OpenTelemetry metrics exporters to remove the protobufjs dependency and include metrics security fixes.
+- Updated dependencies [44ce423]
+- Updated dependencies [51a1a89]
+- Updated dependencies [286b0f8]
+- Updated dependencies [51a1a89]
+- Updated dependencies [57ef2f4]
+  - @powersync/service-core@1.27.1
+  - @powersync/service-types@0.20.0
+  - @powersync/lib-services-framework@0.10.4
+  - @powersync/service-rsocket-router@0.2.29
+
+## 0.2.36
+
+### Patch Changes
+
+- Updated dependencies [0483d4e]
+- Updated dependencies [28f024b]
+- Updated dependencies [5078032]
+- Updated dependencies [424bbc0]
+- Updated dependencies [b70f467]
+- Updated dependencies [c60db6e]
+- Updated dependencies [a8c3f15]
+  - @powersync/service-core@1.27.0
+  - @powersync/service-types@0.19.0
+  - @powersync/lib-services-framework@0.10.3
+  - @powersync/service-rsocket-router@0.2.28
+
+## 0.2.35
+
+### Patch Changes
+
+- Updated dependencies [f842b4e]
+  - @powersync/service-core@1.26.1
+  - @powersync/lib-services-framework@0.10.2
+  - @powersync/service-rsocket-router@0.2.27
+
+## 0.2.34
+
+### Patch Changes
+
+- Updated dependencies [e11c54b]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [0077a8d]
+- Updated dependencies [332d649]
+- Updated dependencies [33a3c23]
+- Updated dependencies [fccdff2]
+- Updated dependencies [989d9e1]
+- Updated dependencies [646c0de]
+- Updated dependencies [cc121b3]
+- Updated dependencies [4e4063b]
+- Updated dependencies [2407f71]
+- Updated dependencies [10131ca]
+- Updated dependencies [4037e8f]
+- Updated dependencies [dd7a22f]
+- Updated dependencies [a997c88]
+  - @powersync/service-core@1.26.0
+  - @powersync/service-types@0.18.0
+  - @powersync/lib-services-framework@0.10.1
+  - @powersync/service-rsocket-router@0.2.26
+
+## 0.2.33
+
+### Patch Changes
+
+- Updated dependencies [27b56cb]
+- Updated dependencies [798d739]
+  - @powersync/service-core@1.25.0
+
+## 0.2.32
+
+### Patch Changes
+
+- Updated dependencies [087b61e]
+- Updated dependencies [2189250]
+- Updated dependencies [922f974]
+- Updated dependencies [c4860c9]
+- Updated dependencies [483415d]
+- Updated dependencies [aab068b]
+- Updated dependencies [37591e9]
+- Updated dependencies [df5663b]
+  - @powersync/service-core@1.24.0
+  - @powersync/lib-services-framework@0.10.0
+  - @powersync/service-types@0.17.0
+  - @powersync/service-rsocket-router@0.2.25
+
+## 0.2.31
+
+### Patch Changes
+
+- Updated dependencies [ea31f64]
+  - @powersync/service-core@1.23.3
+  - @powersync/lib-services-framework@0.9.8
+  - @powersync/service-rsocket-router@0.2.24
+
+## 0.2.30
+
+### Patch Changes
+
+- Updated dependencies [71d4a0a]
+- Updated dependencies [e4f683d]
+- Updated dependencies [71d4a0a]
+- Updated dependencies [c2edf86]
+- Updated dependencies [df9ab1e]
+  - @powersync/service-core@1.23.2
+  - @powersync/service-types@0.16.1
+  - @powersync/lib-services-framework@0.9.7
+  - @powersync/service-rsocket-router@0.2.23
+
+## 0.2.29
+
+### Patch Changes
+
+- Updated dependencies [7e65360]
+  - @powersync/service-core@1.23.1
+
+## 0.2.28
+
+### Patch Changes
+
+- Updated dependencies [a91a08f]
+  - @powersync/service-core@1.23.0
+  - @powersync/service-types@0.16.0
+  - @powersync/lib-services-framework@0.9.6
+  - @powersync/service-rsocket-router@0.2.22
+
 ## 0.2.27
 
 ### Patch Changes

@@ -1,5 +1,5 @@
 import { storage, updateSyncRulesFromYaml } from '@powersync/service-core';
-import { bucketRequest, test_utils } from '@powersync/service-core-tests';
+import { bucketRequest, getTestStorage, test_utils } from '@powersync/service-core-tests';
 import * as bson from 'bson';
 import { describe, expect, test } from 'vitest';
 import { MongoBucketStorage } from '../../src/storage/MongoBucketStorage.js';
@@ -66,7 +66,7 @@ async function storedRowPayload(
     data = doc?.data;
   } else {
     const db = (bucketStorage as any).db;
-    const doc = await db.sourceRecordsV3(syncRulesId, table.id).findOne({});
+    const doc = await db.sourceRecords(syncRulesId, table.id).findOne({});
     data = doc?.data;
   }
   if (data == null) {
@@ -80,7 +80,8 @@ function registerStoreCurrentDataTests(storageVersion: number) {
   test('resolveTables derives storeCurrentData fresh each call, with no persisted memory', async () => {
     await using factory = await INITIALIZED_MONGO_STORAGE_FACTORY.factory();
     const syncRules = await factory.updateSyncRules(updateSyncRulesFromYaml(SYNC_RULES, { storageVersion }));
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
+    const syncRulesContent = syncRules.syncConfigContent[0];
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
 
@@ -113,7 +114,8 @@ function registerStoreCurrentDataTests(storageVersion: number) {
   test('storeCurrentData=false omits the row payload from current_data, data still syncs', async () => {
     await using factory = await INITIALIZED_MONGO_STORAGE_FACTORY.factory();
     const syncRules = await factory.updateSyncRules(updateSyncRulesFromYaml(SYNC_RULES, { storageVersion }));
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
+    const syncRulesContent = syncRules.syncConfigContent[0];
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const table = await test_utils.resolveTestTable(writer, 'test_data', ['id'], INITIALIZED_MONGO_STORAGE_FACTORY);
@@ -129,18 +131,23 @@ function registerStoreCurrentDataTests(storageVersion: number) {
     const checkpoint = flushResult!.flushed_op;
 
     const batch = await test_utils.fromAsync(
-      bucketStorage.getBucketDataBatch(checkpoint, [bucketRequest(syncRules, 'global[]', 0n)])
+      bucketStorage.getBucketDataBatch(test_utils.testCheckpoint(checkpoint), [
+        bucketRequest(syncRulesContent, 'global[]', 0n)
+      ])
     );
     expect(test_utils.getBatchData(batch)).toMatchObject([{ op: 'PUT', object_id: 'test1' }]);
 
     // No row payload retained in current_data.
-    expect(await storedRowPayload(storageVersion, factory, bucketStorage, syncRules.id, table)).toBeNull();
+    expect(
+      await storedRowPayload(storageVersion, factory, bucketStorage, syncRules.replicationStreamId, table)
+    ).toBeNull();
   });
 
   test('storeCurrentData=true retains the row payload in current_data', async () => {
     await using factory = await INITIALIZED_MONGO_STORAGE_FACTORY.factory();
     const syncRules = await factory.updateSyncRules(updateSyncRulesFromYaml(SYNC_RULES, { storageVersion }));
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
+    const syncRulesContent = syncRules.syncConfigContent[0];
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const table = await test_utils.resolveTestTable(writer, 'test_data', ['id'], INITIALIZED_MONGO_STORAGE_FACTORY);
@@ -156,11 +163,15 @@ function registerStoreCurrentDataTests(storageVersion: number) {
     const checkpoint = flushResult!.flushed_op;
 
     const batch = await test_utils.fromAsync(
-      bucketStorage.getBucketDataBatch(checkpoint, [bucketRequest(syncRules, 'global[]', 0n)])
+      bucketStorage.getBucketDataBatch(test_utils.testCheckpoint(checkpoint), [
+        bucketRequest(syncRulesContent, 'global[]', 0n)
+      ])
     );
     expect(test_utils.getBatchData(batch)).toMatchObject([{ op: 'PUT', object_id: 'test1' }]);
 
-    expect(await storedRowPayload(storageVersion, factory, bucketStorage, syncRules.id, table)).toMatchObject({
+    expect(
+      await storedRowPayload(storageVersion, factory, bucketStorage, syncRules.replicationStreamId, table)
+    ).toMatchObject({
       id: 'test1'
     });
   });
@@ -168,7 +179,8 @@ function registerStoreCurrentDataTests(storageVersion: number) {
   test('storeCurrentData=false processes UPDATE without a stored copy', async () => {
     await using factory = await INITIALIZED_MONGO_STORAGE_FACTORY.factory();
     const syncRules = await factory.updateSyncRules(updateSyncRulesFromYaml(SYNC_RULES, { storageVersion }));
-    const bucketStorage = factory.getInstance(syncRules);
+    const bucketStorage = await getTestStorage(factory, syncRules);
+    const syncRulesContent = syncRules.syncConfigContent[0];
 
     await using writer = await bucketStorage.createWriter(test_utils.BATCH_OPTIONS);
     const table = await test_utils.resolveTestTable(writer, 'test_data', ['id'], INITIALIZED_MONGO_STORAGE_FACTORY);
@@ -192,13 +204,17 @@ function registerStoreCurrentDataTests(storageVersion: number) {
     const checkpoint = flushResult!.flushed_op;
 
     const batch = await test_utils.fromAsync(
-      bucketStorage.getBucketDataBatch(checkpoint, [bucketRequest(syncRules, 'global[]', 0n)])
+      bucketStorage.getBucketDataBatch(test_utils.testCheckpoint(checkpoint), [
+        bucketRequest(syncRulesContent, 'global[]', 0n)
+      ])
     );
     const data = test_utils.getBatchData(batch);
     expect(data.length).toBeGreaterThan(0);
     expect(data.at(-1)).toMatchObject({ op: 'PUT', object_id: 'test1' });
 
-    expect(await storedRowPayload(storageVersion, factory, bucketStorage, syncRules.id, table)).toBeNull();
+    expect(
+      await storedRowPayload(storageVersion, factory, bucketStorage, syncRules.replicationStreamId, table)
+    ).toBeNull();
   });
 }
 

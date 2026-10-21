@@ -1,5 +1,51 @@
 # @powersync/service-errors
 
+## 0.6.0
+
+### Minor Changes
+
+- 44ce423: Add `config.source_table_options` to edition 3 sync configs, including MongoDB pre-filtering expressions. Generate editor schemas with examples and report validation errors at their YAML source locations.
+
+  MongoDB replication pre-filtering is not supported in the Open Edition; unsupported configurations report `PSYNC_S1348`. For example:
+
+  ```yaml
+  config:
+    edition: 3
+    source_table_options:
+      orders:
+        mongodb_filter_expression:
+          $and:
+            - $eq: ['$$doc.active', true]
+            - $in: ['$$doc.status', ['pending', 'shipped']]
+  streams:
+    orders:
+      query: SELECT * FROM orders
+  ```
+
+  Validation and deployment reject filters when the feature is unavailable. Parsing accepts an optional map of connection tags to connection types, rejecting MongoDB pre-filtering expressions on known non-MongoDB sources. Unknown connections or missing connection metadata produce advisory warnings. The service supplies connection metadata during validation, deployment, and filesystem loading. Filesystem-loaded sync configs also run source-capability checks. With `exit_on_error` disabled, configs remain available to diagnostics. Changing source-table options requires replacement processing when deploying a new sync config.
+
+  Source capability validation returns structured `ValidationDiagnostic` entries, allowing multiple fatal issues and
+  advisory warnings. Deployment and reprocessing reject fatal diagnostics while validation continues collecting
+  independent findings. Existing `ReplicationError` consumers retain the same diagnostic shape.
+
+- fff5024: Add a replication adapter interface for snapshot predicates and ChangeStream event batches. Both default and filtering providers parse events incrementally with shared split-event assembly. Persist safe resume positions after preceding writes have flushed, including when an adapter excludes all data events. Preserve exact-token resumes within transactions and export a pluggable, disposable ChangeStreamTestContext for module integration tests.
+
+  Expose a shared filtering helper with typed options and keep/exclude/delete decisions. The helper preserves checkpoint and DDL events, source batch boundaries and safe resume progress while counting exclusions. Export the shared stream and filter types from the replication module.
+
+  Report a replication error if a saved sync config requires MongoDB pre-filtering but no query provider factory is registered. Restore the required module, or remove the filters and deploy a new sync config to restart replication.
+
+## 0.5.0
+
+### Minor Changes
+
+- be42e25: Throw a clear error (`PSYNC_R2201`) when a schema wildcard is used in a table pattern with MongoDB, MySQL, SQL Server or Convex connections, instead of silently discovering no tables.
+
+## 0.4.4
+
+### Patch Changes
+
+- a91a08f: [Experimental] Enable incremental reprocessing for MongoDB source + MongoDB storage. This includes significant changes to the v3 storage format.
+
 ## 0.4.3
 
 ### Patch Changes

@@ -58,6 +58,10 @@ export abstract class BaseVersionedPowerSyncMongo {
     return this.upstream.notifyCheckpoint();
   }
 
+  createWriteBatch(session: mongo.ClientSession | undefined, options: { ordered: boolean }) {
+    return this.upstream.createWriteBatch(session, options);
+  }
+
   protected sourceRecordsCollectionName(replicationStreamId: number, sourceTableId: mongo.ObjectId) {
     return this.upstream.sourceRecordsCollectionName(replicationStreamId, sourceTableId);
   }
@@ -67,7 +71,7 @@ export abstract class BaseVersionedPowerSyncMongo {
   }
 
   protected async listCollectionsByPrefix<T extends mongo.Document>(prefix: string): Promise<mongo.Collection<T>[]> {
-    const collections = await this.db.listCollections({ name: new RegExp(`^${prefix}`) }, { nameOnly: true }).toArray();
+    const collections = await this.db.listCollections({ name: { $regex: `^${prefix}` } }, { nameOnly: true }).toArray();
 
     return collections
       .filter((collection) => collection.name.startsWith(prefix))

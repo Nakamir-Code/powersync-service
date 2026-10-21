@@ -1,9 +1,7 @@
 {
   "name": "@powersync/service-module-core",
   "repository": "https://github.com/powersync-ja/powersync-service",
-  "types": "dist/index.d.ts",
-  "version": "0.2.27",
-  "main": "dist/index.js",
+  "version": "0.2.37",
   "license": "FSL-1.1-ALv2",
   "type": "module",
   "publishConfig": {
@@ -16,16 +14,8 @@
     "test": "vitest"
   },
   "exports": {
-    ".": {
-      "import": "./dist/index.js",
-      "require": "./dist/index.js",
-      "default": "./dist/index.js"
-    },
-    "./types": {
-      "import": "./dist/types/types.js",
-      "require": "./dist/types/types.js",
-      "default": "./dist/types/types.js"
-    }
+    ".": "./dist/index.js",
+    "./types": "./dist/types/types.js"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",
@@ -33,6 +23,6 @@
     "@powersync/service-core": "workspace:*",
     "@powersync/service-rsocket-router": "workspace:*",
     "@powersync/service-types": "workspace:*",
-    "fastify": "^5.8.5"
+    "fastify": "^5.12.5"
   }
 }

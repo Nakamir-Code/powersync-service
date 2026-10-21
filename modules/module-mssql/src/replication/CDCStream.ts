@@ -26,27 +26,33 @@ import { MSSQLSourceTable } from '../common/MSSQLSourceTable.js';
 import { MSSQLSourceTableCache } from '../common/MSSQLSourceTableCache.js';
 import { AdditionalConfig } from '../types/types.js';
 import {
+  CaptureInstanceDetails,
   checkRetentionThresholds,
   checkSourceConfiguration,
   createCheckpoint,
   getCaptureInstances,
   getLatestLSN,
-  getLatestReplicatedLSN,
-  isIColumnMetadata
+  getLatestReplicatedLSN
 } from '../utils/mssql.js';
+import { getReplicationIdentityColumns, getTablesFromPattern, ResolvedTable } from '../utils/schema.js';
 import {
-  getReplicationIdentityColumns,
-  getTablesFromPattern,
-  ResolvedTable,
-  SourceTableChangeRef
-} from '../utils/schema.js';
-import { CDCEventHandler, CDCPoller, SchemaChange, SchemaChangeType } from './CDCPoller.js';
+  CaptureInstanceMissingError,
+  createCaptureReconciler,
+  SourceTableUnavailableError
+} from './CaptureReconciler.js';
+import { CDCEventHandler, CDCPoller } from './CDCPoller.js';
 import { MSSQLConnectionManager } from './MSSQLConnectionManager.js';
 import { BatchedSnapshotQuery, MSSQLSnapshotQuery, SimpleSnapshotQuery } from './MSSQLSnapshotQuery.js';
+import type {
+  MSSQLReadyTableReconciliationContext,
+  MSSQLUnavailableTableReconciliationContext
+} from './MSSQLTableReconciliationContext.js';
+import { MSSQLTableReconciliationState } from './MSSQLTableReconciliationContext.js';
+import { SchemaChange, SchemaChangeType } from './SchemaChange.js';
 
 export interface CDCStreamOptions {
-  connections: MSSQLConnectionManager;
   storage: storage.SyncRulesBucketStorage;
+  connections: MSSQLConnectionManager;
   metrics: MetricsEngine;
   abortSignal: AbortSignal;
   logger?: Logger;
@@ -114,6 +120,10 @@ export class CDCStream {
 
   private replicationLag = new ReplicationLagTracker();
 
+  // Latest capture instance warning emitted for each source table.
+  private warnedNewerCaptureObjectId = new Map<number, number>();
+  private warnedSchemaChangeCount = new Map<number, number>();
+
   constructor(private options: CDCStreamOptions) {
     this.logger = options.logger ?? defaultLogger;
     this.storage = options.storage;
@@ -139,7 +149,7 @@ export class CDCStream {
   }
 
   get groupId() {
-    return this.options.storage.group_id;
+    return this.options.storage.replicationStreamId;
   }
 
   get connectionId() {
@@ -178,16 +188,19 @@ export class CDCStream {
 
   async populateTableCache() {
     const sourceTables = this.syncRules.getSourceTables();
+    // Loaded once for all patterns - this reads the CDC metadata for the entire database.
+    const captureInstances = await getCaptureInstances({ connectionManager: this.connections });
     await this.storage.startBatch(
       {
         logger: this.logger,
         zeroLSN: LSN.ZERO,
         defaultSchema: this.defaultSchema,
-        storeCurrentData: false
+        storeCurrentData: false,
+        signal: this.abortSignal
       },
       async (batch) => {
         for (let tablePattern of sourceTables) {
-          await this.getQualifiedTableNames(batch, tablePattern);
+          await this.getQualifiedTableNames(batch, tablePattern, captureInstances);
         }
       }
     );
@@ -195,28 +208,31 @@ export class CDCStream {
 
   async getQualifiedTableNames(
     batch: storage.BucketStorageBatch,
-    tablePattern: TablePattern
+    tablePattern: TablePattern,
+    captureInstances: Map<number, CaptureInstanceDetails>
   ): Promise<MSSQLSourceTable[]> {
     if (tablePattern.connectionTag != this.connections.connectionTag) {
       return [];
     }
 
-    const captureInstances = await getCaptureInstances({ connectionManager: this.connections });
     const matchedTables: ResolvedTable[] = await getTablesFromPattern(this.connections, tablePattern);
+
+    if (matchedTables.length == 0) {
+      await this.reportUnavailableTable(batch, {
+        state: MSSQLTableReconciliationState.TABLE_MISSING,
+        source: {
+          connectionTag: this.connectionTag,
+          name: tablePattern.name,
+          schema: tablePattern.schema,
+          objectId: undefined,
+          // Replica identity metadata is unavailable when the physical table does not exist.
+          replicaIdColumns: []
+        }
+      });
+    }
 
     const tables: MSSQLSourceTable[] = [];
     for (const matchedTable of matchedTables) {
-      const captureInstanceDetails = captureInstances.get(matchedTable.objectId as number);
-      if (!captureInstanceDetails) {
-        // Match Postgres publication handling: If the source table cannot stream changes yet,
-        // don't resolve it into storage. Once CDC is enabled, the schema poller detects the
-        // new capture instance and resolves/snapshots it then.
-        this.logger.info(
-          `Skipping ${tablePattern.schema}.${matchedTable.name} - not enabled for CDC. This table will not be replicated until CDC is enabled for it.`
-        );
-        continue;
-      }
-
       // TODO: Check RLS settings for table
 
       const replicaIdColumns = await getReplicationIdentityColumns({
@@ -225,45 +241,54 @@ export class CDCStream {
         schema: matchedTable.schema
       });
 
-      const table = await this.processTable(
-        batch,
-        {
-          connectionTag: this.connectionTag,
-          name: matchedTable.name,
-          schema: matchedTable.schema,
-          objectId: matchedTable.objectId,
-          replicaIdColumns: replicaIdColumns.columns
-        },
-        captureInstanceDetails.instances[0],
-        false
-      );
+      const source: SourceEntityDescriptor = {
+        connectionTag: this.connectionTag,
+        name: matchedTable.name,
+        schema: matchedTable.schema,
+        objectId: matchedTable.objectId,
+        replicaIdColumns: replicaIdColumns.columns
+      };
+      const captureInstanceDetails = captureInstances.get(matchedTable.objectId);
+      if (!captureInstanceDetails?.instances.length) {
+        await this.reportUnavailableTable(batch, {
+          state: MSSQLTableReconciliationState.CDC_DISABLED,
+          source
+        });
+      } else {
+        const table = await this.processTable(batch, {
+          state: MSSQLTableReconciliationState.READY,
+          source,
+          captureInstances: captureInstanceDetails.instances
+        });
 
-      tables.push(table);
+        tables.push(table);
+      }
     }
     return tables;
   }
 
   async processTable(
     batch: storage.BucketStorageBatch,
-    table: SourceEntityDescriptor,
-    captureInstance: CaptureInstance | null,
-    snapshot: boolean
+    context: MSSQLReadyTableReconciliationContext
   ): Promise<MSSQLSourceTable> {
-    if (!table.objectId && typeof table.objectId != 'number') {
-      throw new ReplicationAssertionError(`objectId expected, got ${typeof table.objectId}`);
+    const { source } = context;
+    if (!source.objectId && typeof source.objectId != 'number') {
+      throw new ReplicationAssertionError(`objectId expected, got ${typeof source.objectId}`);
     }
+    // Load all source metadata before resolving so the storage transaction does no source I/O.
     const resolved = await batch.resolveTables({
       connection_id: this.connectionId,
-      source: table
+      source,
+      reconcileSourceTables: createCaptureReconciler(context)
     });
-    const resolvedTable = new MSSQLSourceTable(table, resolved.tables);
 
-    if (!captureInstance) {
-      this.logger.warn(
-        `Missing capture instance for table ${resolvedTable.toQualifiedName()}. This table will not be replicated until CDC is enabled for it.`
+    const resolvedTable = new MSSQLSourceTable(source, resolved.tables);
+
+    resolvedTable.setCaptureInstance(context.captureInstances);
+    if (!resolvedTable.enabledForCDC()) {
+      throw new ReplicationAssertionError(
+        `No capture instance matching the persisted binding is available for table ${resolvedTable.toQualifiedName()}`
       );
-    } else {
-      resolvedTable.setCaptureInstance(captureInstance);
     }
 
     this.tableCache.set(resolvedTable);
@@ -271,25 +296,24 @@ export class CDCStream {
     // Drop conflicting tables. This includes for example renamed tables.
     await batch.drop(resolved.dropTables);
 
-    // Snapshot if:
-    // 1. The table is in the sync config and snapshot is requested, or not already done.
-    // 2. AND the table is enabled for CDC with a valid capture instance.
-    const snapshotCandidates = resolved.tables.filter(
-      (candidate) => snapshot && !candidate.snapshotComplete && candidate.syncAny
-    );
-    const shouldSnapshot = snapshotCandidates.length > 0 && resolvedTable.enabledForCDC();
-
-    if (shouldSnapshot) {
-      // Truncate tables in case a previous snapshot was interrupted.
-      await batch.truncate(snapshotCandidates);
-
-      // Start the snapshot(s) inside a transaction.
-      for (const candidate of snapshotCandidates) {
-        await this.snapshotTableInTx(batch, resolvedTable, candidate);
-      }
-    }
-
+    // Snapshotting is driven by startInitialReplication, which picks up any source table that is
+    // not snapshot-complete after the table cache has been populated.
     return resolvedTable;
+  }
+
+  private async reportUnavailableTable(
+    batch: storage.BucketStorageBatch,
+    context: MSSQLUnavailableTableReconciliationContext
+  ): Promise<never> {
+    await batch.resolveTables({
+      connection_id: this.connectionId,
+      source: context.source,
+      reconcileSourceTables: createCaptureReconciler(context)
+    });
+    // Unavailable-state reconciliation must reject; this enforces the Promise<never> contract if it returns.
+    throw new ReplicationAssertionError(
+      `Unavailable source-table reconciliation unexpectedly completed for ${context.source.schema}.${context.source.name}`
+    );
   }
 
   private async snapshotTableInTx(
@@ -368,28 +392,23 @@ export class CDCStream {
       this.logger.info(
         `Snapshotting ${physicalTable.toQualifiedName()} ${sourceTable.formatSnapshotProgress()} - not resumable`
       );
-      query = new SimpleSnapshotQuery(transaction, physicalTable.toQualifiedName());
+      query = new SimpleSnapshotQuery(transaction, physicalTable.toQualifiedName(), this.snapshotBatchSize);
       replicatedCount = 0;
     }
-    await query.initialize();
 
-    let hasRemainingData = true;
-    while (hasRemainingData) {
-      // Fetch 10k at a time.
-      // The balance here is between latency overhead per FETCH call,
-      // and not spending too much time on each FETCH call.
-      // We aim for a couple of seconds on each FETCH call.
-      let batchReplicatedCount = 0;
-      let columns: sql.IColumnMetadata | null = null;
-      const cursor = query.next();
-      for await (const result of cursor) {
-        if (columns == null && isIColumnMetadata(result)) {
-          columns = result;
-          continue;
-        } else {
-          if (!columns) {
-            throw new ReplicationAssertionError(`Missing column metadata`);
-          }
+    try {
+      // Fetched once for the whole snapshot. Column changes require deploying a new sync config anyway,
+      // since replication continues against the captured schema until then.
+      const columns = await query.getColumnMetadata();
+
+      let hasRemainingData = true;
+      while (hasRemainingData) {
+        // Fetch this.snapshotBatchSize rows at a time
+        // The balance here is between latency overhead per FETCH call,
+        // and not spending too much time on each FETCH call.
+        // We aim for a couple of seconds on each FETCH call.
+        let batchReplicatedCount = 0;
+        for await (const result of query.nextBatch()) {
           const inputRow: SqliteInputRow = toSqliteInputRow(result, columns);
           const row = this.syncRules.applyRowContext<never>(inputRow);
           // This auto-flushes when the batch reaches its size limit
@@ -405,45 +424,49 @@ export class CDCStream {
           replicatedCount++;
           batchReplicatedCount++;
           this.metrics.getCounter(ReplicationMetric.ROWS_REPLICATED).add(1);
+
+          this.touch();
         }
 
-        this.touch();
-      }
+        // Important: flush before marking progress
+        await batch.flush();
 
-      // Important: flush before marking progress
-      await batch.flush();
+        let lastKey: Uint8Array | undefined;
+        if (query instanceof BatchedSnapshotQuery) {
+          lastKey = query.getLastKeySerialized();
+        }
+        if (lastCountTime < performance.now() - 10 * 60 * 1000) {
+          // Even though we're doing the snapshot inside a transaction, the transaction uses
+          // the default "Read Committed" isolation level. This means we can get new data
+          // within the transaction, so we re-estimate the count every 10 minutes when replicating
+          // large tables.
+          // This uses a separate connection: the snapshot query may still be in progress on the transaction.
+          totalEstimatedCount = await this.estimatedCountNumber(physicalTable);
+          lastCountTime = performance.now();
+        }
+        const updatedSourceTable = await batch.updateTableProgress(sourceTable, {
+          lastKey: lastKey,
+          replicatedCount: replicatedCount,
+          totalEstimatedCount: totalEstimatedCount
+        });
+        this.tableCache.updateSourceTable(updatedSourceTable);
+        sourceTable = updatedSourceTable;
 
-      let lastKey: Uint8Array | undefined;
-      if (query instanceof BatchedSnapshotQuery) {
-        lastKey = query.getLastKeySerialized();
-      }
-      if (lastCountTime < performance.now() - 10 * 60 * 1000) {
-        // Even though we're doing the snapshot inside a transaction, the transaction uses
-        // the default "Read Committed" isolation level. This means we can get new data
-        // within the transaction, so we re-estimate the count every 10 minutes when replicating
-        // large tables.
-        totalEstimatedCount = await this.estimatedCountNumber(physicalTable, transaction);
-        lastCountTime = performance.now();
-      }
-      const updatedSourceTable = await batch.updateTableProgress(sourceTable, {
-        lastKey: lastKey,
-        replicatedCount: replicatedCount,
-        totalEstimatedCount: totalEstimatedCount
-      });
-      this.tableCache.updateSourceTable(updatedSourceTable);
-      sourceTable = updatedSourceTable;
+        if (this.abortSignal.aborted) {
+          // We only abort after flushing
+          throw new ReplicationAbortedError(`Initial replication interrupted`);
+        }
 
-      if (this.abortSignal.aborted) {
-        // We only abort after flushing
-        throw new ReplicationAbortedError(`Initial replication interrupted`);
+        // When the batch of rows is smaller than the requested batch size we know it is the final batch
+        if (batchReplicatedCount < this.snapshotBatchSize) {
+          hasRemainingData = false;
+        } else {
+          this.logger.info(`Snapshotting ${physicalTable.toQualifiedName()} ${sourceTable.formatSnapshotProgress()}`);
+        }
       }
-
-      // When the batch of rows is smaller than the requested batch size we know it is the final batch
-      if (batchReplicatedCount < this.snapshotBatchSize) {
-        hasRemainingData = false;
-      } else {
-        this.logger.info(`Snapshotting ${physicalTable.toQualifiedName()} ${sourceTable.formatSnapshotProgress()}`);
-      }
+    } finally {
+      // Cancel the snapshot query if it is still in progress, so that the transaction can be rolled back.
+      await query.close();
     }
   }
 
@@ -451,10 +474,9 @@ export class CDCStream {
    *  Estimate the number of rows in a table. This query uses partition stats view to get a fast estimate of the row count.
    *  This requires that the MSSQL DB user has the VIEW DATABASE PERFORMANCE STATE permission.
    * @param table
-   * @param transaction
    */
-  async estimatedCountNumber(table: MSSQLSourceTable, transaction?: sql.Transaction): Promise<number> {
-    const request = transaction ? transaction.request() : await this.connections.createRequest();
+  async estimatedCountNumber(table: MSSQLSourceTable): Promise<number> {
+    const request = await this.connections.createRequest();
     const { recordset: result } = await request.input('tableName', table.toQualifiedName()).query(
       `SELECT SUM(row_count) AS total_rows
        FROM sys.dm_db_partition_stats
@@ -479,7 +501,8 @@ export class CDCStream {
         zeroLSN: LSN.ZERO,
         defaultSchema: this.defaultSchema,
         storeCurrentData: false,
-        skipExistingRows: true
+        skipExistingRows: true,
+        signal: this.abortSignal
       },
       async (batch) => {
         switch (status) {
@@ -495,9 +518,18 @@ export class CDCStream {
             break;
           case SnapshotStatus.LIMITED_RESNAPSHOT:
             for (const table of specificTablesToResnapshot!) {
+              if (table.captureInstance == null) {
+                throw new ReplicationAssertionError(
+                  `No capture instance bound for table ${table.toQualifiedName()} while re-snapshotting`
+                );
+              }
               await batch.drop(table.getReplicatedSourceTables());
-              // Update table in the table cache
-              await this.processTable(batch, table.ref, table.captureInstance, false);
+              // Re-resolve against the bound instance only, so the new record keeps the same pin.
+              await this.processTable(batch, {
+                state: MSSQLTableReconciliationState.READY,
+                source: table.ref,
+                captureInstances: [table.captureInstance]
+              });
             }
             break;
           default:
@@ -571,7 +603,7 @@ export class CDCStream {
   private async checkSnapshotStatus(): Promise<SnapshotStatusResult> {
     const status = await this.storage.getStatus();
 
-    if (status.snapshot_done && status.checkpoint_lsn) {
+    if (status.snapshotDone) {
       const additionalTablesToSnapshot: Set<MSSQLSourceTable> = new Set();
       const newTables = this.tableCache
         .getAll()
@@ -583,26 +615,26 @@ export class CDCStream {
         newTables.forEach((table) => additionalTablesToSnapshot.add(table));
       }
 
-      // Snapshot is done, but we still need to check that the last known checkpoint LSN is still
+      // Snapshot is done, but we still need to check that the last known resume LSN is still
       // within the retention threshold of the CDC tables
 
-      const lastCheckpointLSN = LSN.fromString(status.checkpoint_lsn);
+      const lastResumeLSN = LSN.fromString(status.resumeLsn!);
       // Check that the CDC tables still have valid data
       const tablesOutsideRetentionThreshold = await checkRetentionThresholds({
-        checkpointLSN: lastCheckpointLSN,
+        checkpointLSN: lastResumeLSN,
         tables: this.tableCache.getAll(),
         connectionManager: this.connections
       });
       if (tablesOutsideRetentionThreshold.length > 0) {
         this.logger.warn(
-          `Updates from the last checkpoint are no longer available in the CDC instances of the following table(s): ${tablesOutsideRetentionThreshold.map((table) => table.toQualifiedName()).join(', ')}.`
+          `Updates from the last resume LSN are no longer available in the CDC instances of the following table(s): ${tablesOutsideRetentionThreshold.map((table) => table.toQualifiedName()).join(', ')}.`
         );
         tablesOutsideRetentionThreshold.forEach((table) => additionalTablesToSnapshot.add(table));
       }
       if (additionalTablesToSnapshot.size > 0) {
         return {
           status: SnapshotStatus.LIMITED_RESNAPSHOT,
-          snapshotLSN: status.checkpoint_lsn,
+          snapshotLSN: status.resumeLsn,
           specificTablesToResnapshot: Array.from(additionalTablesToSnapshot)
         };
       } else {
@@ -613,8 +645,8 @@ export class CDCStream {
       }
     } else {
       return {
-        status: status.snapshot_lsn != null ? SnapshotStatus.RESUME : SnapshotStatus.INITIAL,
-        snapshotLSN: status.snapshot_lsn
+        status: status.resumeLsn != null ? SnapshotStatus.RESUME : SnapshotStatus.INITIAL,
+        snapshotLSN: status.resumeLsn
       };
     }
   }
@@ -626,7 +658,8 @@ export class CDCStream {
         zeroLSN: LSN.ZERO,
         defaultSchema: this.defaultSchema,
         storeCurrentData: false,
-        skipExistingRows: false
+        skipExistingRows: false,
+        signal: this.abortSignal
       },
       async (batch) => {
         if (batch.resumeFromLsn == null) {
@@ -639,7 +672,6 @@ export class CDCStream {
           connectionManager: this.connections,
           eventHandler,
           getReplicatedTables: () => this.tableCache.getAll(),
-          sourceTables: this.syncRules.getSourceTables(),
           startLSN,
           logger: this.logger,
           additionalConfig: this.options.additionalConfig,
@@ -723,110 +755,69 @@ export class CDCStream {
   }
 
   async handleSchemaChange(batch: storage.BucketStorageBatch, change: SchemaChange): Promise<void> {
-    let actionedSchemaChange = true;
-
     switch (change.type) {
       case SchemaChangeType.TABLE_RENAME:
-        const fromTable = change.table!;
-        this.logger.info(
-          `Table ${fromTable.toQualifiedName()} has been renamed ${change.newTable ? `to [${change.newTable.name}].` : '.'}`
+        // Continuing could commit past unread changes because the rename has no known LSN.
+        throw new SourceTableUnavailableError(
+          `Table ${change.table.toQualifiedName()} has been renamed to [${change.newTable.name}]. ` +
+            `Deploy a new sync config that uses the new name to replicate it again. ` +
+            `Its already-replicated data is retained until then.`
         );
-
-        // Old table needs to be cleaned up
-        const fromTables = fromTable.getReplicatedSourceTables();
-        await batch.drop(fromTables);
-        this.tableCache.delete(fromTable.objectId);
-
-        if (change.newTable) {
-          await this.handleCreateOrUpdateTable(batch, change.newTable, change.newCaptureInstance!);
+      case SchemaChangeType.TABLE_DROP:
+        throw new SourceTableUnavailableError(
+          `Table ${change.table.toQualifiedName()} has been dropped from the source. Deploy a new sync config ` +
+            `that no longer includes it. Its already-replicated data is retained until the new sync config ` +
+            `becomes active.`
+        );
+      case SchemaChangeType.TABLE_COLUMN_CHANGES:
+        this.warnColumnChanges(change.table, change.captureInstance);
+        break;
+      case SchemaChangeType.NEW_CAPTURE_INSTANCE: {
+        // Warn once per newer instance and keep polling the pinned one.
+        const { table, newCaptureInstance } = change;
+        if (this.warnedNewerCaptureObjectId.get(table.objectId) !== newCaptureInstance.objectId) {
+          this.logger.warn(
+            `A newer CDC capture instance (object id ${newCaptureInstance.objectId}) is available for table ${table.toQualifiedName()}, ` +
+              `but the current replication process remains pinned to capture instance object id ${table.pinnedCaptureObjectId}. ` +
+              `Deploy a new sync config to adopt the new capture instance, and keep the current instance ` +
+              `available until that sync config becomes active.`
+          );
+          this.warnedNewerCaptureObjectId.set(table.objectId, newCaptureInstance.objectId);
         }
         break;
-      case SchemaChangeType.TABLE_CREATE:
-        await this.handleCreateOrUpdateTable(batch, change.newTable!, change.newCaptureInstance!);
-        break;
-      case SchemaChangeType.TABLE_COLUMN_CHANGES:
-        await this.handleColumnChanges(change.table!, change.newCaptureInstance!);
-        actionedSchemaChange = false;
-        break;
-      case SchemaChangeType.NEW_CAPTURE_INSTANCE:
-        this.logger.info(
-          `New CDC capture instance detected for table ${change.table!.toQualifiedName()}. Re-snapshotting table...`
-        );
-        await batch.drop(change.table!.getReplicatedSourceTables());
-        this.tableCache.delete(change.table!.objectId);
-
-        await this.handleCreateOrUpdateTable(batch, change.table!.ref, change.newCaptureInstance!);
-        break;
-      case SchemaChangeType.TABLE_DROP:
-        await batch.drop(change.table!.getReplicatedSourceTables());
-        this.tableCache.delete(change.table!.objectId);
-        break;
+      }
       case SchemaChangeType.MISSING_CAPTURE_INSTANCE:
-        // Stop replication for this table until CDC is re-enabled.
-        this.logger.warn(
-          `Table ${change.table!.toQualifiedName()} has been disabled for CDC. Re-enable CDC to continue replication.`
+        // A replacement may have a different schema, so never adopt it in place.
+        throw new CaptureInstanceMissingError(
+          `The CDC capture instance for table ${change.table.toQualifiedName()} (pinned to object id ` +
+            `${change.table.pinnedCaptureObjectId}) is no longer available. ` +
+            `PowerSync cannot continue replicating the table - a dropped capture instance cannot be ` +
+            `restored, because re-enabling CDC creates a new one with a different object id. ` +
+            (change.replacementInstance
+              ? `Deploy a new sync config to adopt the replacement.`
+              : `Re-enable CDC for this table, then deploy a new sync config.`)
         );
-        change.table!.clearCaptureInstance();
-        actionedSchemaChange = false;
-        break;
       default:
-        throw new ReplicationAssertionError(`Unknown schema change type: ${change.type}`);
+        throw new ReplicationAssertionError(`Unknown schema change type: ${(change as SchemaChange).type}`);
     }
-
-    // Create a new checkpoint after the schema change
-    if (actionedSchemaChange) {
-      await createCheckpoint(this.connections);
-    }
-  }
-
-  private async handleCreateOrUpdateTable(
-    batch: storage.BucketStorageBatch,
-    table: SourceTableChangeRef,
-    captureInstance: CaptureInstance
-  ): Promise<void> {
-    const replicaIdColumns = await getReplicationIdentityColumns({
-      connectionManager: this.connections,
-      tableName: table.name,
-      schema: table.schema
-    });
-
-    await this.processTable(
-      batch,
-      {
-        connectionTag: this.connectionTag,
-        name: table.name,
-        schema: table.schema,
-        objectId: table.objectId,
-        replicaIdColumns: replicaIdColumns.columns
-      },
-      captureInstance,
-      true
-    );
+    // Warning-only changes do not need a checkpoint.
   }
 
   /**
-   * There is very little that can be automatically done to handle the column changes other than to warn the user about the schema drift.
-   *
-   * Due to the way CDC works, users are prevented from making column schema changes that affect the replication identities of a table.
-   * If changes like that are required, CDC has to be disabled and re-enabled for the table. This would then be handled by the detection of the new
-   * capture instance.
-   * @param table
-   * @param captureInstance
+   * Warn about column drift while continuing with the pinned capture schema.
    */
-  private async handleColumnChanges(table: MSSQLSourceTable, captureInstance: CaptureInstance): Promise<void> {
-    // Check there are any new pending schema changes
-    if (
-      table.captureInstance?.objectId === captureInstance.objectId &&
-      table.captureInstance?.pendingSchemaChanges.length === captureInstance.pendingSchemaChanges.length
-    ) {
+  private warnColumnChanges(table: MSSQLSourceTable, captureInstance: CaptureInstance): void {
+    const changeCount = captureInstance.pendingSchemaChanges.length;
+    if (this.warnedSchemaChangeCount.get(table.objectId) === changeCount) {
       return;
     }
 
-    // New pending schema changes were detected - warn about those as well.
     this.logger.warn(
-      `Schema drift detected for table ${table.toQualifiedName()}. To ensure consistency, disable and re-enable CDC for this table.\n Pending schema changes:\n ${captureInstance.pendingSchemaChanges.join(', \n')}`
+      `Schema drift detected for table ${table.toQualifiedName()}. Until a new sync config becomes active, ` +
+        `replication continues against the captured schema, so these changes are not replicated. Deploy a new ` +
+        `sync config to pick them up.\n Pending schema changes:\n ${captureInstance.pendingSchemaChanges.join(', \n')}`
     );
-    table.captureInstance = captureInstance;
+    this.warnedSchemaChangeCount.set(table.objectId, changeCount);
   }
 
   /**

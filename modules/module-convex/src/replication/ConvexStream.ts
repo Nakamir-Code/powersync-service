@@ -5,7 +5,8 @@ import {
   ErrorCode,
   Logger,
   ReplicationAbortedError,
-  ReplicationAssertionError
+  ReplicationAssertionError,
+  ServiceError
 } from '@powersync/lib-services-framework';
 import {
   MetricsEngine,
@@ -28,8 +29,8 @@ import { ConvexConnectionManager } from './ConvexConnectionManager.js';
 import { BinaryConvexSnapshotProgressCursor, decodeSnapshotProgressCursor } from './ConvexSnapshotProgressCursor.js';
 
 export interface ConvexStreamOptions {
-  connections: ConvexConnectionManager;
   storage: storage.SyncRulesBucketStorage;
+  connections: ConvexConnectionManager;
   metrics: MetricsEngine;
   abortSignal: AbortSignal;
   logger?: Logger;
@@ -139,7 +140,7 @@ export class ConvexStream {
 
     const { lastOpId } = await this.initialReplication(status.snapshotLsn);
     if (lastOpId != null) {
-      await this.storage.populatePersistentChecksumCache({
+      await this.storage.compactInitialReplication({
         signal: this.abortSignal,
         maxOpId: lastOpId
       });
@@ -154,7 +155,8 @@ export class ConvexStream {
       // Convex document_deltas include the full document state after each mutation,
       // so storage does not need to keep current row data to apply partial updates.
       storeCurrentData: false,
-      skipExistingRows: false
+      skipExistingRows: false,
+      signal: this.abortSignal
     });
 
     let resumeFromLsn = batch.resumeFromLsn;
@@ -309,7 +311,7 @@ export class ConvexStream {
 
   private async initSlot(): Promise<{ needsInitialSync: boolean; snapshotLsn: string | null }> {
     const status = await this.storage.getStatus();
-    if (status.snapshot_done && status.checkpoint_lsn) {
+    if (status.snapshotDone) {
       this.logger.info('Initial replication already done');
       return {
         needsInitialSync: false,
@@ -319,7 +321,7 @@ export class ConvexStream {
 
     return {
       needsInitialSync: true,
-      snapshotLsn: status.snapshot_lsn
+      snapshotLsn: status.resumeLsn
     };
   }
 
@@ -330,7 +332,8 @@ export class ConvexStream {
       defaultSchema: this.defaultSchema,
       // Convex snapshots emit complete documents, so no current row state is needed.
       storeCurrentData: false,
-      skipExistingRows: true
+      skipExistingRows: true,
+      signal: this.abortSignal
     });
 
     const snapshotCursor = await this.resolveSnapshotBoundary(snapshotLsn);
@@ -520,6 +523,13 @@ export class ConvexStream {
   ): Promise<SourceTable[]> {
     if (tablePattern.connectionTag != this.connections.connectionTag) {
       return [];
+    }
+
+    if (tablePattern.isSchemaWildcard) {
+      throw new ServiceError(
+        ErrorCode.PSYNC_R2201,
+        'Schema wildcards ("%") in table patterns are not supported for Convex connections.'
+      );
     }
 
     if (tablePattern.schema != this.defaultSchema) {

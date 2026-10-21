@@ -1,0 +1,88 @@
+# Agent Guidance for PowerSync Service
+
+This repository contains the PowerSync service packages, source replication modules, storage modules, and technical documentation.
+
+Keep this file concise. Use it to route agents to the right docs and nearby implementation examples rather than duplicating full specifications here.
+
+## General Workflow
+
+- Prefer existing module patterns over new abstractions.
+- Keep changes scoped to the package or module relevant to the task.
+- For integration tests, prefer the existing test utilities and fixtures in the relevant module.
+- Prefer real implementations for tests that validate cross-module behavior. If a test only needs to observe calls or arguments, prefer Vitest spies such as `vi.spyOn()` before introducing mocks. Use mocks only when testing specific unit behavior or when a real dependency is impractical.
+
+## Development Commands
+
+- Use Node from [`.nvmrc`](.nvmrc) and pnpm from the root [`packageManager`](package.json). Plain `pnpm ...` commands are fine when the shell already activates those versions. If a non-interactive shell picks the wrong versions, run commands through `source ~/.nvm/nvm.sh && nvm use && corepack pnpm ...`.
+- Install dependencies with `pnpm install` or, when Corepack is not already active, `corepack pnpm install`. CI enables Corepack before installing dependencies; match that locally when needed.
+- This is a pnpm workspace. Use `corepack pnpm --filter <package-or-path> <script>` for focused package commands.
+- Confirm package names in each package's `package.json`; do not use the top-level package name for package-specific filters. Path filters such as `--filter './modules/module-postgres'` are often the clearest option.
+- Build the full workspace with `corepack pnpm build`. For a focused package, use `corepack pnpm --filter './modules/module-postgres' build`.
+- Run core tests with `corepack pnpm test:core`. Run package tests with `corepack pnpm --filter './modules/module-postgres' test` or from the package directory with `corepack pnpm test`.
+- Focus Vitest runs with a file or test name where useful, for example `corepack pnpm --filter './modules/module-postgres' test test/src/wal_stream.test.ts --run -t "record too large"`.
+- Run `corepack pnpm format:dirty` before finishing changes that touch formatted source files. Use `corepack pnpm format:check` and `corepack pnpm validate:tsconfig-references` when formatting or project references may be affected.
+- Local service setup is documented in [`DEVELOP.md`](DEVELOP.md). The service usually needs Postgres and MongoDB test services plus local `service/powersync.yaml` and `service/sync-config.yaml` files.
+- CI plans live in [`.github/workflows`](.github/workflows). Check them when choosing the closest local verification command for a change.
+
+## Replication Work
+
+Use this section when working on source replication modules, replication streams, source connector behavior, bucket storage writers, checkpoints, write checkpoints, initial snapshots, sync config deployment, or replication tests.
+
+### User-Facing Sync Config Terminology
+
+- In changesets, documentation, warnings, and errors, describe the operator action as **deploy a new sync config** (or **redeploy the sync config** when no config edit is required).
+- Do not tell users to create or deploy a sync config "as a new replication stream." Replication streams, processing configs, and jobs are implementation details, not additional operator actions.
+- When the internal effect is useful context, explain it separately: a sync config deployment starts replacement processing, and the active sync config can keep serving clients while the replacement snapshots and catches up. Depending on storage support, that work may use a separate replication stream or a processing config in the existing stream.
+- For rolling source schema changes, state that the old table or capture instance must remain available until the new sync config becomes active. Call out expected downtime separately when the change requires disabling CDC or otherwise removes the active binding first.
+
+### Sync Rules Deprecation
+
+Sync Rules (`bucket_definitions:` with `parameters:` and `data:` queries) are deprecated in favour of Sync Streams (`streams:`).
+
+- **Sync config** is the whole deployed YAML, regardless of engine. Use `SyncConfig` in identifiers and lowercase "sync config" in comments and messages.
+- **Sync Streams** is the current engine. Every new or example sync config, including tests, fixtures, and templates, uses `streams:` with `config: edition: 3`. Do not add new `bucket_definitions:` examples or fixtures.
+- **Legacy Sync Rules** is the deprecated engine. Its implementation lives in `packages/sync-rules/src/legacy/` and is marked `@deprecated`. Do not add features there.
+- Capitalize "Sync Streams", "Sync Stream", "Sync Rules", and "legacy Sync Rules" in comments, JSDoc, messages, test names, and docs. Identifiers keep code casing (`SyncStreamsCompiler`, `streams:`, `sync_rules`).
+- Lowercase "sync stream" means the client's streaming sync connection (`routes/endpoints/sync-stream.ts`, "Sync stream started"), a different concept. Reword ambiguous sentences to "the client's sync connection" or "the stream definition".
+- Never rename these public or persisted names: `/api/sync-rules/v1/*` route paths; JSON fields `sync_rules_content`, `active_sync_rules`, `deploying_sync_rules`, `sync_rules`, `bucket_definitions`, `data_queries`, `parameter_queries`; the MongoDB `sync_rules` collection, `custom_write_checkpoints.sync_rules_id`, index `user_sync_rule_unique`, `op_id_sequence` key `sync_rules`, and `rule_mapping`; the Postgres `sync_rules` table, `sync_rules_id_sequence`, `custom_write_checkpoints.sync_rules_id`, constraint `unique_user_sync`, and lock name prefix `sync_rules_`; `SyncRuleState` string values; migration scripts and changelogs; the npm package `@powersync/service-sync-rules`, `packages/sync-rules`, and `schema/sync_rules.json`; error codes `PSYNC_R0001` and `PSYNC_R2201`; the MySQL server-id format.
+
+### Load Spec Context Selectively
+
+Do not load every replication spec page by default. Start with the entry point, then load only the pages that match the task.
+
+- Always start with [`docs/replication/README.md`](docs/replication/README.md) for the outside-in map and code anchors.
+- Use [`01-core-concepts.md`](docs/replication/01-core-concepts.md) when terminology is unclear, especially replication streams, modules, source positions, `SourceTable`, checkpoints, and write checkpoints.
+- Use [`02-replication-lifecycle.md`](docs/replication/02-replication-lifecycle.md) for `ReplicationEngine`, `AbstractReplicator`, job lifecycle, locks, cleanup, and stream states.
+- Use [`03-source-connector-overview.md`](docs/replication/03-source-connector-overview.md) for source config, `RouteAPI`, schema metadata, source stream requirements, keepalive responsibilities, and table discovery.
+- Use [`04-storage-writer-overview.md`](docs/replication/04-storage-writer-overview.md) for the storage writer workflow: source table resolution, source changes, checkpoint boundaries, resume positions, and snapshot state. Use interface JSDoc for method-level details.
+- Use [`05-snapshots-and-streaming.md`](docs/replication/05-snapshots-and-streaming.md) for initial replication, resumable snapshots, source consistency boundaries, ongoing streaming, schema changes, and history loss.
+- Use [`06-checkpoints.md`](docs/replication/06-checkpoints.md) for storage checkpoints, bucket checksums, parameter lookups, managed write checkpoints, custom write checkpoints, and source-side marker tables.
+- Use [`07-source-modules.md`](docs/replication/07-source-modules.md) to compare existing Postgres, MongoDB, MySQL, SQL Server, and Convex implementations.
+- Use [`08-ai-agent-plans.md`](docs/replication/08-ai-agent-plans.md) when creating a new replication module or planning a substantial source-module change.
+
+### Branch By Task
+
+- New replication module: read [`README.md`](docs/replication/README.md), [`01-core-concepts.md`](docs/replication/01-core-concepts.md), [`03-source-connector-overview.md`](docs/replication/03-source-connector-overview.md), [`07-source-modules.md`](docs/replication/07-source-modules.md), and [`08-ai-agent-plans.md`](docs/replication/08-ai-agent-plans.md). Start with Plan 1 in [`08-ai-agent-plans.md`](docs/replication/08-ai-agent-plans.md), then load the later plan sections only as the implementation reaches them.
+- Existing replication module change: read [`README.md`](docs/replication/README.md), the relevant source section in [`07-source-modules.md`](docs/replication/07-source-modules.md), and only the overview page that matches the change. For example, use [`03-source-connector-overview.md`](docs/replication/03-source-connector-overview.md) for route/config/schema work, [`05-snapshots-and-streaming.md`](docs/replication/05-snapshots-and-streaming.md) for snapshot or streaming behavior, and [`06-checkpoints.md`](docs/replication/06-checkpoints.md) for write checkpoints.
+- Storage writer or bucket storage change: read [`README.md`](docs/replication/README.md), [`04-storage-writer-overview.md`](docs/replication/04-storage-writer-overview.md), and [`06-checkpoints.md`](docs/replication/06-checkpoints.md). Add [`05-snapshots-and-streaming.md`](docs/replication/05-snapshots-and-streaming.md) only if snapshot consistency, history loss, or streaming boundaries are involved.
+- Checkpoint or write-checkpoint change: read [`README.md`](docs/replication/README.md) and [`06-checkpoints.md`](docs/replication/06-checkpoints.md). Add [`03-source-connector-overview.md`](docs/replication/03-source-connector-overview.md) when `RouteAPI.createReplicationHead()` or source-side marker behavior is involved.
+- Replication lifecycle, locks, cleanup, or job orchestration: read [`README.md`](docs/replication/README.md) and [`02-replication-lifecycle.md`](docs/replication/02-replication-lifecycle.md). Add [`07-source-modules.md`](docs/replication/07-source-modules.md) when comparing current module behavior.
+- Tests only: load the spec page for the behavior being tested, plus the testing sections in [`08-ai-agent-plans.md`](docs/replication/08-ai-agent-plans.md) when creating or changing a source-module test context.
+
+After loading the relevant spec context, inspect the closest existing implementation and tests before editing.
+
+### Replication Testing
+
+- Prefer integration tests with real bucket storage implementations for snapshot, streaming, checkpoint, and write-checkpoint behavior.
+- Import real test storage factories from storage modules, such as `@powersync/service-module-mongodb-storage` and `@powersync/service-module-postgres-storage`, and use `describeWithStorage`-style coverage where practical.
+- Add a stream test context for new modules, following existing examples such as `WalStreamTestContext`, `ChangeStreamTestContext`, `BinlogStreamTestContext`, `CDCStreamTestContext`, or `ConvexStreamTestContext`.
+- For when to use spies versus mocks, follow the General Workflow testing guidance above.
+
+### Backwards-compatibility
+
+The NPM packages here do not follow semver: We do not guarantee any backwards-compatibility on package APIs. Backwards-compatibility is only relevant for the service itself.
+
+For storage:
+
+1. We preserve backwards-compatibility for Postres storage and MongoDB storage with storage_version: 1 and 2, and future even versions.
+2. We do not preserve backwards-compatibility for MongoDB storage with storage_version: 3, or any future odd version numbers.

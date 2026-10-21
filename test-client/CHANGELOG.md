@@ -1,5 +1,110 @@
 # test-client
 
+## 0.1.84
+
+### Patch Changes
+
+- Updated dependencies [44ce423]
+- Updated dependencies [51a1a89]
+- Updated dependencies [286b0f8]
+- Updated dependencies [57ef2f4]
+  - @powersync/service-core@1.27.1
+
+## 0.1.83
+
+### Patch Changes
+
+- Updated dependencies [0483d4e]
+- Updated dependencies [28f024b]
+- Updated dependencies [5078032]
+- Updated dependencies [424bbc0]
+- Updated dependencies [b70f467]
+- Updated dependencies [c60db6e]
+- Updated dependencies [a8c3f15]
+  - @powersync/service-core@1.27.0
+
+## 0.1.82
+
+### Patch Changes
+
+- Updated dependencies [f842b4e]
+  - @powersync/service-core@1.26.1
+
+## 0.1.81
+
+### Patch Changes
+
+- Updated dependencies [e11c54b]
+- Updated dependencies [189bd9e]
+- Updated dependencies [bb08068]
+- Updated dependencies [0077a8d]
+- Updated dependencies [332d649]
+- Updated dependencies [33a3c23]
+- Updated dependencies [fccdff2]
+- Updated dependencies [989d9e1]
+- Updated dependencies [646c0de]
+- Updated dependencies [cc121b3]
+- Updated dependencies [4e4063b]
+- Updated dependencies [2407f71]
+- Updated dependencies [10131ca]
+- Updated dependencies [4037e8f]
+- Updated dependencies [dd7a22f]
+- Updated dependencies [a997c88]
+  - @powersync/service-core@1.26.0
+
+## 0.1.80
+
+### Patch Changes
+
+- Updated dependencies [27b56cb]
+- Updated dependencies [798d739]
+  - @powersync/service-core@1.25.0
+
+## 0.1.79
+
+### Patch Changes
+
+- Updated dependencies [087b61e]
+- Updated dependencies [2189250]
+- Updated dependencies [922f974]
+- Updated dependencies [c4860c9]
+- Updated dependencies [483415d]
+- Updated dependencies [aab068b]
+- Updated dependencies [37591e9]
+  - @powersync/service-core@1.24.0
+
+## 0.1.78
+
+### Patch Changes
+
+- Updated dependencies [ea31f64]
+  - @powersync/service-core@1.23.3
+
+## 0.1.77
+
+### Patch Changes
+
+- Updated dependencies [71d4a0a]
+- Updated dependencies [e4f683d]
+- Updated dependencies [71d4a0a]
+- Updated dependencies [c2edf86]
+- Updated dependencies [df9ab1e]
+  - @powersync/service-core@1.23.2
+
+## 0.1.76
+
+### Patch Changes
+
+- Updated dependencies [7e65360]
+  - @powersync/service-core@1.23.1
+
+## 0.1.75
+
+### Patch Changes
+
+- Updated dependencies [a91a08f]
+  - @powersync/service-core@1.23.0
+
 ## 0.1.74
 
 ### Patch Changes

@@ -2,7 +2,7 @@
   <a href="https://www.powersync.com" target="_blank"><img src="https://github.com/powersync-ja/.github/assets/7372448/d2538c43-c1a0-4c47-9a76-41462dba484f"/></a>
 </p>
 
-_[PowerSync](https://www.powersync.com) is a sync engine for building local-first apps with instantly-responsive UI/UX and simplified state transfer. Syncs between SQLite on the client-side and Postgres, MongoDB or MySQL on the server-side._
+_[PowerSync](https://www.powersync.com) keeps a client-side SQLite database in sync with your backend database. Changes appear across users and devices in real-time, user interactions feel instant and your app continues to work even when offline. Supports Postgres, MongoDB, Azure DocumentDB, MySQL, and SQL Server. Client SDKs are available for a wide range of environments including web, mobile, desktop, headless and embedded._
 
 # Quick reference
 
@@ -35,6 +35,17 @@ docker run \
 See the [documentation](https://docs.powersync.com/self-hosting/installation) for additional information.
 
 See the [Docker Compose Demo](https://github.com/powersync-ja/self-host-demo) for a Docker Compose quick start.
+
+# How to use the npm package
+
+The same service is published as an npm package, for environments where running the image is not an option, such as Windows Server. Use the exact NodeJS version as the Docker image for the release. **This deployment method is not officially supported**, and may have issues not present in the Docker image release.
+
+```bash
+npm install @powersync/service-image
+npx powersync-service start -c config.yaml
+```
+
+The configuration is the same as for the image.
 
 # Telemetry
 

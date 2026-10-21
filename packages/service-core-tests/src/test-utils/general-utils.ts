@@ -1,10 +1,11 @@
-import { BucketDataRequest, InternalOpId, JwtPayload, storage, utils } from '@powersync/service-core';
+import { BucketDataRequest, InternalOpId, isBatchEnd, JwtPayload, storage, utils } from '@powersync/service-core';
 import { GetQuerierOptions, RequestParameters } from '@powersync/service-sync-rules';
 import * as bson from 'bson';
+import { fromAsync } from './stream_utils.js';
 
 export const ZERO_LSN = '0/0';
 
-export const PARSE_OPTIONS: storage.ParseSyncRulesOptions = {
+export const PARSE_OPTIONS: storage.ParseSyncConfigOptions = {
   defaultSchema: 'public'
 };
 
@@ -13,6 +14,31 @@ export const BATCH_OPTIONS: storage.CreateWriterOptions = {
   zeroLSN: ZERO_LSN,
   storeCurrentData: true
 };
+
+export function testCheckpoint(checkpoint: InternalOpId, lsn: string | null = null): storage.ReplicationCheckpoint {
+  return {
+    checkpoint,
+    lsn,
+    async getParameterSets() {
+      return [];
+    }
+  };
+}
+
+/**
+ * Deploy a sync config and return both the replication stream (for {@link storage.BucketStorageFactory.getInstance})
+ * and the deployed config content (for parsing / bucket requests).
+ *
+ * Replication streams and sync config content are separate concerns since one stream can hold multiple configs.
+ */
+export async function deploySyncRules(
+  factory: storage.BucketStorageFactory,
+  options: storage.UpdateSyncRulesOptions
+): Promise<{ stream: storage.PersistedReplicationStream; content: storage.PersistedSyncConfigContent }> {
+  const stream = await factory.updateSyncRules(options);
+  const content = stream.syncConfigContent[0];
+  return { stream, content };
+}
 
 /**
  * With newer storage versions, we need actual test tables, resolved via the writer.
@@ -61,7 +87,10 @@ export async function resolveTestTable(
 }
 
 export function getBatchData(
-  batch: utils.SyncBucketData[] | storage.SyncBucketDataChunk[] | storage.SyncBucketDataChunk
+  batch:
+    | utils.SyncBucketData[]
+    | (storage.SyncBucketDataChunk | storage.SyncBucketDataBatchEnd)[]
+    | storage.SyncBucketDataChunk
 ) {
   const first = getFirst(batch);
   if (first == null) {
@@ -78,9 +107,9 @@ export function getBatchData(
 }
 
 function isParsedSyncRules(
-  syncRules: storage.PersistedSyncRulesContent | storage.PersistedSyncRules
-): syncRules is storage.PersistedSyncRules {
-  return (syncRules as storage.PersistedSyncRules).syncConfigWithErrors !== undefined;
+  syncRules: storage.PersistedSyncConfigContent | storage.ParsedSyncConfigSet
+): syncRules is storage.ParsedSyncConfigSet {
+  return (syncRules as storage.ParsedSyncConfigSet).syncConfigs !== undefined;
 }
 
 /**
@@ -88,7 +117,7 @@ function isParsedSyncRules(
  * This converts a bucket name like "global[]" into the actual bucket name, for use in tests.
  */
 export function bucketRequest(
-  syncRules: storage.PersistedSyncRulesContent | storage.PersistedSyncRules,
+  syncRules: storage.PersistedSyncConfigContent | storage.ParsedSyncConfigSet,
   bucket: string,
   start?: InternalOpId | string | number
 ): BucketDataRequest {
@@ -97,10 +126,13 @@ export function bucketRequest(
   const parameterStart = bucket.indexOf('[');
   const definitionName = bucket.substring(0, parameterStart);
   const parameters = bucket.substring(parameterStart);
-  const source = parsed.syncConfigWithErrors.config.bucketDataSources.find((b) => b.uniqueName === definitionName);
+  const availableSources = parsed.syncConfigs.flatMap((config) => config.config.bucketDataSources);
+  const source = availableSources.find((b) => b.uniqueName === definitionName);
 
   if (source == null) {
-    throw new Error(`Failed to find global bucket ${bucket}`);
+    throw new Error(
+      `Failed to find global bucket ${bucket}. Available: ${availableSources.map((s) => s.uniqueName).join(',')}`
+    );
   }
   const bucketName = hydrationState.getBucketSourceScope(source).bucketPrefix + parameters;
   return {
@@ -124,8 +156,28 @@ export function getBatchMeta(
   };
 }
 
+export async function getBatchArray(
+  data: AsyncIterable<storage.SyncBucketDataChunk | storage.SyncBucketDataBatchEnd>
+): Promise<storage.SyncBucketDataChunk[]> {
+  const array = await fromAsync(data);
+  return array.filter((c) => !isBatchEnd(c) && c.chunkData.data.length > 0) as storage.SyncBucketDataChunk[];
+}
+
+export async function getSingleBatchItem(
+  data: AsyncIterable<storage.SyncBucketDataChunk | storage.SyncBucketDataBatchEnd>
+): Promise<storage.SyncBucketDataChunk> {
+  const array = await getBatchArray(data);
+  if (array.length != 1) {
+    throw new Error(`Expected a single batch item, got ${array.length}`);
+  }
+  return array[0];
+}
+
 function getFirst(
-  batch: utils.SyncBucketData[] | storage.SyncBucketDataChunk[] | storage.SyncBucketDataChunk
+  batch:
+    | utils.SyncBucketData[]
+    | (storage.SyncBucketDataChunk | storage.SyncBucketDataBatchEnd)[]
+    | storage.SyncBucketDataChunk
 ): utils.SyncBucketData | null {
   if (!Array.isArray(batch)) {
     return batch.chunkData;

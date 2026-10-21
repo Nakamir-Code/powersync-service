@@ -4,7 +4,8 @@ import { env } from './env.js';
 
 export const INITIALIZED_MONGO_STORAGE_FACTORY = mongoTestStorageFactoryGenerator({
   url: env.MONGO_TEST_URL,
-  isCI: env.CI
+  isCI: env.CI,
+  supportsMultipleSyncConfigs: true
 });
 
 export const INITIALIZED_MONGO_REPORT_STORAGE_FACTORY = mongoTestReportStorageFactoryGenerator({
@@ -12,4 +13,4 @@ export const INITIALIZED_MONGO_REPORT_STORAGE_FACTORY = mongoTestReportStorageFa
   isCI: env.CI
 });
 
-export const TEST_STORAGE_VERSIONS = SUPPORTED_STORAGE_VERSIONS;
+export const TEST_STORAGE_VERSIONS = SUPPORTED_STORAGE_VERSIONS.filter((v) => v != 3);

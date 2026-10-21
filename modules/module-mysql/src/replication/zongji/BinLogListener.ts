@@ -1,4 +1,4 @@
-import { Logger, logger as defaultLogger } from '@powersync/lib-services-framework';
+import { Logger, ReplicationAssertionError, logger as defaultLogger } from '@powersync/lib-services-framework';
 import { BinLogEvent, BinLogQueryEvent, StartOptions, TableMapEntry, ZongJi } from '@powersync/mysql-zongji';
 import { TablePattern } from '@powersync/service-sync-rules';
 import async from 'async';
@@ -33,6 +33,19 @@ const { Parser } = pkg;
  *  Seconds of inactivity after which a keepalive event is sent by the MySQL server.
  */
 export const KEEPALIVE_INACTIVITY_THRESHOLD = 30;
+
+/**
+ *  Maximum time in milliseconds to wait for Zongji to stop before force-closing its control connection.
+ */
+export const ZONGJI_STOP_TIMEOUT = 5_000;
+
+/**
+ *  Maximum time in milliseconds a control connection liveness probe may execute before the
+ *  connection is considered dead. Time the probe spends queued behind other control queries
+ *  does not count towards this.
+ */
+export const CTRL_CONNECTION_PROBE_TIMEOUT = 5_000;
+
 export type Row = Record<string, any>;
 
 /**
@@ -76,10 +89,18 @@ export interface BinLogListenerOptions {
   connectionManager: MySQLConnectionManager;
   eventHandler: BinLogEventHandler;
   sourceTables: TablePattern[];
+  /**
+   *  Id that identifies this replication client.
+   */
   serverId: number;
+  /**
+   *  The server uuid of the source MySQL server that is being replicated.
+   */
+  activeServerUuid: string;
   startGTID: common.ReplicatedGTID;
   logger?: Logger;
   keepAliveInactivitySeconds?: number;
+  ctrlConnectionProbeTimeoutMs?: number;
 }
 
 /**
@@ -88,8 +109,6 @@ export interface BinLogListenerOptions {
  */
 export class BinLogListener {
   private sqlParser: ParserType;
-  private connectionManager: MySQLConnectionManager;
-  private eventHandler: BinLogEventHandler;
   private binLogPosition: common.BinLogPosition;
   private currentGTID: common.ReplicatedGTID;
   private logger: Logger;
@@ -99,8 +118,12 @@ export class BinLogListener {
   private isStopped: boolean = false;
   private isStopping: boolean = false;
 
+  // Set while a control connection probe is awaiting a response, so repeated probes do not pile up behind it.
+  private probePending: boolean = false;
+
   // Flag to indicate if are currently in a transaction that involves multiple row mutation events.
   private isTransactionOpen = false;
+
   zongji: ZongJi;
   processingQueue: async.QueueObject<BinLogEvent>;
 
@@ -111,15 +134,26 @@ export class BinLogListener {
 
   constructor(public options: BinLogListenerOptions) {
     this.logger = options.logger ?? defaultLogger;
-    this.connectionManager = options.connectionManager;
-    this.eventHandler = options.eventHandler;
-    this.binLogPosition = options.startGTID.position;
+    // Copy the position: the listener mutates it as events are processed, and the caller's startGTID must not change
+    this.binLogPosition = { ...options.startGTID.position };
     this.currentGTID = options.startGTID;
     this.sqlParser = new Parser();
     this.processingQueue = this.createProcessingQueue();
     this.zongji = this.createZongjiListener();
     this.listenerError = null;
     this.databaseFilter = this.createDatabaseFilter(options.sourceTables);
+  }
+
+  private get connectionManager(): MySQLConnectionManager {
+    return this.options.connectionManager;
+  }
+
+  private get eventHandler(): BinLogEventHandler {
+    return this.options.eventHandler;
+  }
+
+  private get activeServerUuid(): string {
+    return this.options.activeServerUuid;
   }
 
   /**
@@ -205,12 +239,29 @@ export class BinLogListener {
   private async stopZongji(): Promise<void> {
     if (!this.zongji.stopped) {
       this.logger.info('Stopping BinLog Listener...');
-      await new Promise<void>((resolve) => {
+      const controlConnection = this.zongji.ctrlConnection;
+      let stopped = false;
+      const stopPromise = new Promise<void>((resolve) => {
         this.zongji.once('stopped', () => {
+          stopped = true;
           resolve();
         });
         this.zongji.stop();
       });
+      // Zongji only emits 'stopped' once the KILL query on its control connection has completed.
+      // If that connection has been dead for a while, the query can block on TCP retransmissions
+      // for many minutes, so we destroy the socket after a timeout to unblock the stop.
+      const timeout = timers.setTimeout(ZONGJI_STOP_TIMEOUT, undefined, { ref: false }).then(() => {
+        if (!stopped) {
+          this.logger.warn('Timed out waiting for the BinLog Listener to stop. Closing the control connection.');
+          controlConnection._socket?.destroy();
+        }
+      });
+      await Promise.race([stopPromise, timeout]);
+      // Zongji destroys the control connection when it stops, which drops pending query callbacks:
+      // a probe waiting on this connection would otherwise stay pending forever and disable
+      // probing after a restart.
+      this.probePending = false;
       this.logger.info('BinLog Listener stopped.');
     }
   }
@@ -234,6 +285,41 @@ export class BinLogListener {
       this.logger.error('BinLog Listener stopped due to an error:', this.listenerError);
       throw this.listenerError;
     }
+  }
+
+  /**
+   *  The binlog connection is kept alive by the MySQL server heartbeat, but the control connection
+   *  carries no traffic between metadata queries. TCP keepalive stops it from being dropped when idle,
+   *  but detects an already dead connection slowly, so the replication job's keepAlive additionally
+   *  probes it with a lightweight query and stops the listener (restarting replication) if the probe
+   *  does not respond in time.
+   *
+   *  The driver starts the query timeout when the query begins executing, not when it is queued, so a
+   *  probe waiting behind a legitimately slow metadata query does not produce a false failure. A probe
+   *  queued on a dead socket is failed together with the queued query by TCP keepalive on the socket.
+   */
+  public probeControlConnection(): void {
+    if (this.probePending || this.zongji.stopped || this.isStopped || this.isStopping) {
+      return;
+    }
+    this.probePending = true;
+    const controlConnection = this.zongji.ctrlConnection;
+    const timeout = this.options.ctrlConnectionProbeTimeoutMs ?? CTRL_CONNECTION_PROBE_TIMEOUT;
+    controlConnection.query({ sql: 'SELECT 1', timeout }, (error) => {
+      this.probePending = false;
+      // Only act if the probe failed on a connection that is still supposed to be alive.
+      if (
+        error != null &&
+        this.zongji.ctrlConnection === controlConnection &&
+        !this.zongji.stopped &&
+        !(this.isStopped || this.isStopping)
+      ) {
+        this.logger.warn('MySQL control connection is unresponsive. Stopping the BinLog Listener...');
+        this.listenerError = new Error('MySQL control connection is unresponsive.');
+        controlConnection._socket?.destroy();
+        this.stop();
+      }
+    });
   }
 
   private createProcessingQueue(): async.QueueObject<BinLogEvent> {
@@ -266,7 +352,11 @@ export class BinLogListener {
           `BinLog processing queue has reached its memory limit of [${this.connectionManager.options.binlog_queue_memory_limit}MB]. Pausing BinLog Listener.`
         );
         await this.stopZongji();
-        await this.processingQueue.drain();
+        // The queue may have drained while waiting for Zongji's stop acknowledgement.
+        // drain() only waits for future events, so do not wait on an already idle queue.
+        if (!this.processingQueue.idle()) {
+          await this.processingQueue.drain();
+        }
         this.logger.info(`BinLog processing queue backlog cleared. Resuming BinLog Listener.`);
         await this.restartZongji();
       }
@@ -292,29 +382,41 @@ export class BinLogListener {
     return async (evt: BinLogEvent) => {
       switch (true) {
         case zongji_utils.eventIsGTIDLog(evt):
-          this.currentGTID = common.ReplicatedGTID.fromBinLogEvent({
-            raw_gtid: {
-              server_id: evt.serverId,
-              transaction_range: evt.transactionRange
+          const transactionGTID = common.ReplicatedGTID.fromBinLogEvent({
+            rawGtid: {
+              serverUuid: evt.serverId, // The server uuid this transaction originated from
+              transactionId: evt.transactionRange
             },
             position: {
               filename: this.binLogPosition.filename,
               offset: evt.nextPosition
             }
           });
+
+          if (transactionGTID.serverUuid !== this.activeServerUuid) {
+            throw new ReplicationAssertionError(
+              `Detected a transaction from a different MySQL server UUID: ${transactionGTID.serverUuid} than the server that is currently being replicated from: ${this.activeServerUuid}. ` +
+                `A re-snapshot is required to ensure consistency.`
+            );
+          }
+
+          this.currentGTID = transactionGTID;
           this.binLogPosition.offset = evt.nextPosition;
+
           await this.eventHandler.onTransactionStart({ timestamp: new Date(evt.timestamp) });
           this.logger.info(`Processed GTID event: ${this.currentGTID.comparable}`);
           break;
         case zongji_utils.eventIsRotation(evt):
           // The first event when starting replication is a synthetic Rotate event
-          // It describes the last binlog file and position that the replica client processed
+          // It describes the the position and file that the replica requested to start from
+          const isNewFile = this.binLogPosition.filename !== evt.binlogName;
+
           this.binLogPosition.filename = evt.binlogName;
-          this.binLogPosition.offset = evt.nextPosition !== 0 ? evt.nextPosition : evt.position;
+          this.binLogPosition.offset = evt.position;
+
           await this.eventHandler.onRotate();
 
-          const newFile = this.binLogPosition.filename !== evt.binlogName;
-          if (newFile) {
+          if (isNewFile) {
             this.logger.info(
               `Processed Rotate event. New BinLog file is: ${this.binLogPosition.filename}:${this.binLogPosition.offset}`
             );
@@ -359,11 +461,7 @@ export class BinLogListener {
           break;
         case zongji_utils.eventIsXid(evt):
           this.isTransactionOpen = false;
-          this.binLogPosition.offset = evt.nextPosition;
-          const LSN = new common.ReplicatedGTID({
-            raw_gtid: this.currentGTID.raw,
-            position: this.binLogPosition
-          }).comparable;
+          const LSN = this.advanceCommitPosition(evt.nextPosition);
           await this.eventHandler.onCommit(LSN);
           this.logger.info(`Processed Xid event - transaction complete. LSN: ${LSN}.`);
           break;
@@ -374,6 +472,21 @@ export class BinLogListener {
 
       this.queueMemoryUsage -= evt.size;
     };
+  }
+
+  /**
+   *  Advances the binlog position to the end of a committed transaction and updates the currentGTID to match.
+   *  This ensures subsequent heartbeat keepalives report an LSN that is not behind the last commit LSN,
+   *  which would otherwise block checkpoint creation until the next transaction arrives.
+   *  Returns the commit LSN.
+   */
+  private advanceCommitPosition(nextPosition: number): string {
+    this.binLogPosition.offset = nextPosition;
+    this.currentGTID = new common.ReplicatedGTID({
+      rawGtid: this.currentGTID.raw,
+      position: { ...this.binLogPosition }
+    });
+    return this.currentGTID.comparable;
   }
 
   private async processQueryEvent(event: BinLogQueryEvent): Promise<void> {
@@ -398,11 +511,7 @@ export class BinLogListener {
       // DDL queries are auto commited, but do not come with a corresponding Xid event, in those cases we trigger a manual commit if we are not already in a transaction.
       // Some DDL queries include row events, and in those cases will include a Xid event.
       if (!this.isTransactionOpen) {
-        this.binLogPosition.offset = nextPosition;
-        const LSN = new common.ReplicatedGTID({
-          raw_gtid: this.currentGTID.raw,
-          position: this.binLogPosition
-        }).comparable;
+        const LSN = this.advanceCommitPosition(nextPosition);
         await this.eventHandler.onCommit(LSN);
       }
 
@@ -419,11 +528,7 @@ export class BinLogListener {
         await this.restartZongji();
       }
     } else if (!this.isTransactionOpen) {
-      this.binLogPosition.offset = nextPosition;
-      const LSN = new common.ReplicatedGTID({
-        raw_gtid: this.currentGTID.raw,
-        position: this.binLogPosition
-      }).comparable;
+      const LSN = this.advanceCommitPosition(nextPosition);
       await this.eventHandler.onCommit(LSN);
     }
   }

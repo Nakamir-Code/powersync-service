@@ -20,6 +20,14 @@ export enum ErrorCode {
 
   // ## PSYNC_R22xx: SQL supported feature issues
 
+  /**
+   * A table or schema wildcard ("%") is not supported by the configured source connector.
+   *
+   * Wildcard support is connector-specific. For example, SQL Server requires exact table and
+   * schema names, while some other connectors support table wildcards but not schema wildcards.
+   */
+  PSYNC_R2201 = 'PSYNC_R2201',
+
   // ## PSYNC_R23xx: SQL schema mismatch issues
 
   // ## PSYNC_R24xx: SQL security warnings
@@ -320,6 +328,13 @@ export enum ErrorCode {
    */
   PSYNC_S1347 = 'PSYNC_S1347',
 
+  /**
+   * MongoDB replication pre-filtering is not supported in the Open Edition.
+   *
+   * Remove the pre-filtering expressions from the sync config or use an edition of the PowerSync service which supports them.
+   */
+  PSYNC_S1348 = 'PSYNC_S1348',
+
   // ## PSYNC_S14xx: MongoDB storage replication issues
 
   /**
@@ -338,15 +353,46 @@ export enum ErrorCode {
   // ## PSYNC_S16xx: MSSQL replication issues
 
   /**
-   *  A replicated source table's capture instance has been dropped during a polling cycle.
+   *  The CDC capture instance a replicated source table was bound to has been dropped.
    *
    *  Possible causes:
    *  * CDC has been disabled for the table.
    *  * The table has been dropped, which also drops the capture instance.
    *
-   *  Replication for the table will only resume once CDC has been re-enabled for the table.
+   *  Replication stops and requires a sync config redeployment. Re-enabling CDC creates a new capture
+   *  instance, which the existing stream will not adopt.
    */
   PSYNC_S1601 = 'PSYNC_S1601',
+
+  /**
+   *  A table in the sync configuration is not ready to be replicated.
+   *
+   *  Possible causes:
+   *  * CDC has not been enabled for the table.
+   *  * The table does not exist in the source database.
+   *
+   *  For a table that has not been replicated by this stream before, replication starts once the
+   *  table exists and has CDC enabled, without a new sync deploy.
+   *
+   *  For a table this stream was already replicating, re-enabling CDC is not enough: the new capture
+   *  instance has a different object id, so the next attempt fails with `PSYNC_S1601` until the sync
+   *  config is redeployed.
+   */
+  PSYNC_S1602 = 'PSYNC_S1602',
+
+  /**
+   *  A replicated source table was dropped, renamed, recreated, or no longer matches the source
+   *  identity selected by the current replication process.
+   *
+   *  Replication stops because the table may still have unread changes. A sync config deployment
+   *  is required to adopt the replacement; existing replicated data is retained until then.
+   */
+  PSYNC_S1603 = 'PSYNC_S1603',
+
+  /**
+   *  MSSQL connection configuration error.
+   */
+  PSYNC_S1604 = 'PSYNC_S1604',
 
   // ## PSYNC_S2xxx: Service API
 
@@ -534,5 +580,10 @@ export enum ErrorCode {
    *
    * When a sync config is specified in the service config, the dynamic sync config API is disabled.
    */
-  PSYNC_S4105 = 'PSYNC_S4105'
+  PSYNC_S4105 = 'PSYNC_S4105',
+
+  /**
+   * Sync config reprocess is blocked because another sync config is deploying.
+   */
+  PSYNC_S4106 = 'PSYNC_S4106'
 }

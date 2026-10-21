@@ -1,55 +1,225 @@
-import { mongo } from '@powersync/lib-service-mongodb';
 import * as framework from '@powersync/lib-services-framework';
-import { GetCheckpointChangesOptions, InternalOpId, storage } from '@powersync/service-core';
+import { GetCheckpointChangesOptions, storage } from '@powersync/service-core';
 import { VersionedPowerSyncMongo } from './db.js';
 
 export type MongoCheckpointAPIOptions = {
   db: VersionedPowerSyncMongo;
-  mode: storage.WriteCheckpointMode;
-  sync_rules_id: number;
+  writeCheckpointMode: storage.WriteCheckpointModeConfig;
+  replicationStreamId: number;
 };
 
 export class MongoWriteCheckpointAPI implements storage.WriteCheckpointAPI {
   readonly db: VersionedPowerSyncMongo;
+  readonly replicationStreamId: number;
+
   private _mode: storage.WriteCheckpointMode;
 
   constructor(options: MongoCheckpointAPIOptions) {
     this.db = options.db;
-    this._mode = options.mode;
+    this._mode = options.writeCheckpointMode.mode;
+    this.replicationStreamId = options.replicationStreamId;
   }
 
   get writeCheckpointMode() {
     return this._mode;
   }
 
-  setWriteCheckpointMode(mode: storage.WriteCheckpointMode): void {
-    this._mode = mode;
+  setWriteCheckpointMode(config: storage.WriteCheckpointModeConfig): void {
+    this._mode = config.mode;
   }
 
-  async createManagedWriteCheckpoint(checkpoint: storage.ManagedWriteCheckpointOptions): Promise<bigint> {
+  async createManagedWriteCheckpoints(
+    checkpoints: storage.ManagedWriteCheckpointOptions[]
+  ): Promise<storage.CreateManagedWriteCheckpointsResult> {
     if (this.writeCheckpointMode !== storage.WriteCheckpointMode.MANAGED) {
       throw new framework.ServiceAssertionError(
         `Attempting to create a managed Write Checkpoint when the current Write Checkpoint mode is set to "${this.writeCheckpointMode}"`
       );
     }
 
-    const { user_id, heads: lsns } = checkpoint;
-    const doc = await this.db.write_checkpoints.findOneAndUpdate(
-      {
-        user_id: user_id
-      },
-      {
-        $set: {
-          lsns,
-          processed_at_lsn: null
+    const uniqueCheckpoints = storage.uniqueManagedWriteCheckpoints(checkpoints);
+    if (uniqueCheckpoints.length == 0) {
+      return { writeCheckpoints: new Map(), shouldAdvance: false };
+    }
+
+    let shouldAdvance = false;
+    const writeCheckpoints = new Map<string, bigint>();
+    const generatedCheckpoints = uniqueCheckpoints.filter((checkpoint) => checkpoint.checkpoint_request_id == null);
+    const suppliedCheckpoints = uniqueCheckpoints.filter((checkpoint) => checkpoint.checkpoint_request_id != null);
+
+    if (generatedCheckpoints.length == 1) {
+      // For the common case of a single checkpoint, we can do this in a single request.
+      const { user_id, heads: lsns } = generatedCheckpoints[0];
+      const doc = await this.db.write_checkpoints.findOneAndUpdate(
+        {
+          user_id
         },
-        $inc: {
-          client_id: 1n
-        }
-      },
-      { upsert: true, returnDocument: 'after' }
+        {
+          $set: {
+            lsns,
+            processed_at_lsn: null
+          },
+          // Unset rather than set to null, to keep the document out of the
+          // partial checkpoint_requested_at index used for retention cleanup.
+          $unset: {
+            checkpoint_requested_at: 1
+          },
+          $inc: {
+            client_id: 1n
+          }
+        },
+        { upsert: true, returnDocument: 'after' }
+      );
+
+      // Generated checkpoints always reset processed_at_lsn, so they are pending
+      // and the source marker must be forced.
+      shouldAdvance = true;
+      writeCheckpoints.set(doc!.user_id, doc!.client_id);
+    } else if (generatedCheckpoints.length > 1) {
+      // For more than one generated checkpoint, this gives a constant 2 requests.
+      await this.db.write_checkpoints.bulkWrite(
+        generatedCheckpoints.map(({ user_id, heads: lsns }) => ({
+          updateOne: {
+            filter: { user_id },
+            update: {
+              $set: {
+                lsns,
+                processed_at_lsn: null
+              },
+              $unset: {
+                checkpoint_requested_at: 1
+              },
+              $inc: {
+                client_id: 1n
+              }
+            },
+            upsert: true
+          }
+        })),
+        { ordered: false }
+      );
+
+      const userIds = generatedCheckpoints.map((checkpoint) => checkpoint.user_id);
+      const docs = await this.db.write_checkpoints
+        .find(
+          {
+            user_id: { $in: userIds }
+          },
+          {
+            projection: {
+              user_id: 1,
+              client_id: 1
+            }
+          }
+        )
+        .toArray();
+
+      shouldAdvance = true;
+      for (const doc of docs) {
+        writeCheckpoints.set(doc.user_id, doc.client_id);
+      }
+    }
+
+    if (suppliedCheckpoints.length > 0) {
+      const suppliedResult = await this.createSuppliedManagedWriteCheckpoints(suppliedCheckpoints);
+      shouldAdvance ||= suppliedResult.shouldAdvance;
+      for (const [userId, writeCheckpoint] of suppliedResult.writeCheckpoints) {
+        writeCheckpoints.set(userId, writeCheckpoint);
+      }
+    }
+
+    return { writeCheckpoints, shouldAdvance };
+  }
+
+  private async createSuppliedManagedWriteCheckpoints(checkpoints: storage.ManagedWriteCheckpointOptions[]) {
+    const checkpointRequestedAt = new Date();
+
+    await this.db.write_checkpoints.bulkWrite(
+      checkpoints.map((checkpoint) => {
+        const { user_id, heads: lsns } = checkpoint;
+        const checkpointRequestId = checkpoint.checkpoint_request_id!;
+
+        // Supplied request ids are monotonic. updateMany preserves the existing
+        // upsert behavior for first checkpoint requests, while also advancing
+        // every duplicate row for the user_id that is lower than this request id.
+        const shouldApplyRequestId = {
+          $or: [
+            { $eq: [{ $ifNull: ['$client_id', null] }, null] },
+            { $lt: ['$client_id', { $literal: checkpointRequestId }] }
+          ]
+        };
+        // Equal retries keep their original source head but refresh retention.
+        const shouldRefreshRequest = {
+          $or: [
+            { $eq: [{ $ifNull: ['$client_id', null] }, null] },
+            { $lte: ['$client_id', { $literal: checkpointRequestId }] }
+          ]
+        };
+
+        return {
+          updateMany: {
+            filter: { user_id },
+            update: [
+              {
+                $set: {
+                  user_id,
+                  client_id: {
+                    $cond: [shouldApplyRequestId, { $literal: checkpointRequestId }, '$client_id']
+                  },
+                  lsns: {
+                    $cond: [shouldApplyRequestId, { $literal: lsns }, '$lsns']
+                  },
+                  processed_at_lsn: {
+                    $cond: [shouldApplyRequestId, null, '$processed_at_lsn']
+                  },
+                  checkpoint_requested_at: {
+                    $cond: [shouldRefreshRequest, { $literal: checkpointRequestedAt }, '$checkpoint_requested_at']
+                  }
+                }
+              }
+            ],
+            upsert: true
+          }
+        };
+      }),
+      { ordered: false }
     );
-    return doc!.client_id;
+
+    // Fetch the final ids separately so stale requests can still return the
+    // checkpoint currently stored. If duplicate rows already exist for a
+    // user_id, use the highest stored id instead of whichever document MongoDB
+    // happens to return first.
+    const userIds = checkpoints.map((checkpoint) => checkpoint.user_id);
+    const docs = await this.db.write_checkpoints
+      .find(
+        {
+          user_id: { $in: userIds }
+        },
+        {
+          projection: {
+            user_id: 1,
+            client_id: 1,
+            processed_at_lsn: 1
+          }
+        }
+      )
+      .toArray();
+    const maxDocsByUser = new Map<string, (typeof docs)[number]>();
+    for (const doc of docs) {
+      const existing = maxDocsByUser.get(doc.user_id);
+      if (
+        existing == null ||
+        doc.client_id > existing.client_id ||
+        (doc.client_id == existing.client_id && existing.processed_at_lsn != null && doc.processed_at_lsn == null)
+      ) {
+        maxDocsByUser.set(doc.user_id, doc);
+      }
+    }
+
+    return {
+      writeCheckpoints: new Map([...maxDocsByUser].map(([userId, doc]) => [userId, doc.client_id])),
+      shouldAdvance: [...maxDocsByUser.values()].some((doc) => doc.processed_at_lsn == null)
+    };
   }
 
   async lastWriteCheckpoint(filters: storage.LastWriteCheckpointFilters): Promise<bigint | null> {
@@ -81,6 +251,7 @@ export class MongoWriteCheckpointAPI implements storage.WriteCheckpointAPI {
   }
 
   protected async lastCustomWriteCheckpoint(filters: storage.CustomWriteCheckpointFilters) {
+    // Legacy V1/V2 implementation.
     const { user_id, sync_rules_id } = filters;
     const lastWriteCheckpoint = await this.db.custom_write_checkpoints.findOne({
       user_id,
@@ -135,8 +306,9 @@ export class MongoWriteCheckpointAPI implements storage.WriteCheckpointAPI {
     };
   }
 
-  private async getCustomWriteCheckpointChanges(options: GetCheckpointChangesOptions) {
+  protected async getCustomWriteCheckpointChanges(options: GetCheckpointChangesOptions) {
     const limit = 1000;
+    // Legacy V1/V2 implementation.
     const changes = await this.db.custom_write_checkpoints
       .find(
         {
@@ -165,32 +337,4 @@ export class MongoWriteCheckpointAPI implements storage.WriteCheckpointAPI {
       updatedWriteCheckpoints
     };
   }
-}
-
-export async function batchCreateCustomWriteCheckpoints(
-  db: VersionedPowerSyncMongo,
-  session: mongo.ClientSession,
-  checkpoints: storage.CustomWriteCheckpointOptions[],
-  opId: InternalOpId
-): Promise<void> {
-  if (checkpoints.length == 0) {
-    return;
-  }
-
-  await db.custom_write_checkpoints.bulkWrite(
-    checkpoints.map((checkpointOptions) => ({
-      updateOne: {
-        filter: { user_id: checkpointOptions.user_id, sync_rules_id: checkpointOptions.sync_rules_id },
-        update: {
-          $set: {
-            checkpoint: checkpointOptions.checkpoint,
-            sync_rules_id: checkpointOptions.sync_rules_id,
-            op_id: opId
-          }
-        },
-        upsert: true
-      }
-    })),
-    { session }
-  );
 }

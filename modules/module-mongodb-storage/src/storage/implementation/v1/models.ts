@@ -48,6 +48,7 @@ export function serializeBucketDataV1(document: BucketDataDoc): BucketDataDocume
     op: document.op,
     source_table: document.source_table,
     source_key: document.source_key,
+    subkey: document.subkey,
     table: document.table,
     row_id: document.row_id,
     checksum: document.checksum,
@@ -78,7 +79,7 @@ export interface SourceTableDocumentV1 extends SourceTableDocument {
   group_id: number;
 }
 
-export interface SyncRuleDocumentV1 extends SyncRuleDocumentBase, SyncRuleCheckpointFields<string | null> {
+export interface SyncRuleDocumentV1 extends SyncRuleDocumentBase, SyncRuleCheckpointFields {
   content: string;
   serialized_plan?: SerializedSyncPlan | null;
 
@@ -88,6 +89,16 @@ export interface SyncRuleDocumentV1 extends SyncRuleDocumentBase, SyncRuleCheckp
    * Can only be false if state == PROCESSING.
    */
   snapshot_done: boolean;
+
+  /**
+   * Goes together with no_checkpoint_before.
+   *
+   * If a keepalive is triggered that creates the checkpoint > no_checkpoint_before,
+   * then the checkpoint must be equal to this keepalive_op.
+   *
+   * string for legacy reasons - it's always a number.
+   */
+  keepalive_op: string | null;
 }
 
 export interface BucketStateDocumentV1 extends BucketStateDocumentBase {

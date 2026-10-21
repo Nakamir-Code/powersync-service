@@ -33,7 +33,7 @@ export interface PartialChecksum {
  */
 export type InternalOpId = bigint;
 
-export const ID_NAMESPACE = 'a396dd91-09fc-4017-a28d-3df722f651e9';
+export const ID_NAMESPACE = uuid.parse('a396dd91-09fc-4017-a28d-3df722f651e9');
 
 export function escapeIdentifier(identifier: string) {
   return `"${identifier.replace(/"/g, '""').replace(/\./g, '"."')}"`;
@@ -223,7 +223,7 @@ export function isCompleteRow<V>(
  * All other operations are replaced with a single CLEAR operation,
  * summing their checksums, and using a 0 as an op_id.
  *
- * This is the function $r(B)$, as described in /docs/bucket-properties.md.
+ * This is the function $r(B)$, as described in /docs/storage/bucket-properties.md.
  *
  * Used for tests.
  */
@@ -308,4 +308,18 @@ export function estimateRowSize(record: sync_rules.ToastableSqliteRow | undefine
     }
   }
   return size;
+}
+
+export function formatBytes(bytes: number | bigint): string {
+  if (typeof bytes == 'bigint') {
+    bytes = Number(bytes); // We round either way
+  }
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+  } else if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  } else if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)}KB`;
+  }
+  return `${bytes}B`;
 }

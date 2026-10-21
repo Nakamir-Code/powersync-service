@@ -1,4 +1,5 @@
 import { logger, LookupOptions } from '@powersync/lib-services-framework';
+import { validateStorageVersion } from '@powersync/service-sync-rules';
 import { configFile } from '@powersync/service-types';
 import * as auth from '../../auth/auth-index.js';
 import { ConfigCollector } from './collectors/config-collector.js';
@@ -6,6 +7,8 @@ import { Base64ConfigCollector } from './collectors/impl/base64-config-collector
 import { FallbackConfigCollector } from './collectors/impl/fallback-config-collector.js';
 import { FileSystemConfigCollector } from './collectors/impl/filesystem-config-collector.js';
 import {
+  DEFAULT_CHECKPOINT_REQUEST_RETENTION_MINUTES,
+  DEFAULT_CHECKSUM_CACHE_TTL_MINUTES,
   DEFAULT_MAX_BUCKETS_PER_CONNECTION,
   DEFAULT_MAX_CONCURRENT_CONNECTIONS,
   DEFAULT_MAX_DATA_FETCH_CONCURRENCY,
@@ -59,6 +62,11 @@ export class CompoundConfigCollector {
    */
   async collectConfig(runnerConfig: RunnerConfig = {}): Promise<ResolvedPowerSyncConfig> {
     const baseConfig = await this.collectBaseConfig(runnerConfig);
+
+    const defaultStorageVersion = baseConfig.storage?.default_storage_version;
+    if (defaultStorageVersion != null && validateStorageVersion(defaultStorageVersion) == null) {
+      throw new Error(`Storage version ${defaultStorageVersion} is not supported`);
+    }
 
     const dataSources = baseConfig.replication?.connections ?? [];
     if (dataSources.length > 1) {
@@ -193,7 +201,13 @@ export class CompoundConfigCollector {
         max_concurrent_connections:
           baseConfig.api?.parameters?.max_concurrent_connections ?? DEFAULT_MAX_CONCURRENT_CONNECTIONS,
         max_data_fetch_concurrency:
-          baseConfig.api?.parameters?.max_data_fetch_concurrency ?? DEFAULT_MAX_DATA_FETCH_CONCURRENCY
+          baseConfig.api?.parameters?.max_data_fetch_concurrency ?? DEFAULT_MAX_DATA_FETCH_CONCURRENCY,
+        checkpoint_request_retention_minutes: normalizeCheckpointRequestRetentionMinutes(
+          baseConfig.api?.parameters?.checkpoint_request_retention_minutes
+        ),
+        bucket_count_cache_ttl_minutes: normalizeChecksumCacheTtlMinutes(
+          baseConfig.api?.parameters?.bucket_count_cache_ttl_minutes
+        )
       },
       // TODO maybe move this out of the connection or something
       slot_name_prefix: baseConfig.replication?.connections?.[0]?.slot_name_prefix ?? 'powersync_',
@@ -248,4 +262,20 @@ export class CompoundConfigCollector {
       exit_on_error: true
     };
   }
+}
+
+function normalizeChecksumCacheTtlMinutes(ttlMinutes: number | undefined): number {
+  const normalized = ttlMinutes ?? DEFAULT_CHECKSUM_CACHE_TTL_MINUTES;
+  if (!Number.isFinite(normalized) || !Number.isInteger(normalized) || normalized < 1) {
+    throw new Error('api.parameters.bucket_count_cache_ttl_minutes must be a positive integer');
+  }
+  return normalized;
+}
+
+function normalizeCheckpointRequestRetentionMinutes(retentionMinutes: number | undefined): number {
+  const normalized = retentionMinutes ?? DEFAULT_CHECKPOINT_REQUEST_RETENTION_MINUTES;
+  if (!Number.isFinite(normalized) || !Number.isInteger(normalized) || normalized < 1) {
+    throw new Error('api.parameters.checkpoint_request_retention_minutes must be a positive integer');
+  }
+  return normalized;
 }

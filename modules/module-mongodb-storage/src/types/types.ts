@@ -1,15 +1,107 @@
 import * as lib_mongo from '@powersync/lib-service-mongodb';
+import { ErrorCode, ServiceError } from '@powersync/lib-services-framework';
 import * as service_types from '@powersync/service-types';
 import * as t from 'ts-codec';
 
-export const MongoStorageConfig = lib_mongo.BaseMongoConfig.and(
+/**
+ * AWS defaults mode, as used by the AWS SDK.
+ *
+ * This is the baseline for the object storage request timeouts, so that they do not each need to be
+ * configured individually.
+ *
+ * The SDK's `legacy` and `auto` modes are not selectable here: `legacy` defines no timeouts at all,
+ * and `auto` makes the timeouts depend on where the process happens to be running. Both are still
+ * handled when they come from the AWS environment, and are then treated as `standard`.
+ */
+export const S3DefaultsMode = service_types.enumLiteral('standard', 'in-region', 'cross-region', 'mobile');
+
+export type S3DefaultsMode = t.Encoded<typeof S3DefaultsMode>;
+
+const S3ObjectStorageConfig = t.object({
+  type: t.literal('s3'),
+  bucket: t.string,
+  region: t.string.optional(),
+  prefix: t.string.optional(),
+  endpoint: t.string.optional(),
+  force_path_style: t.boolean.optional(),
+  access_key_id: t.string.optional(),
+  secret_access_key: t.string.optional(),
+  concurrency_limit: t.number.optional(),
+  // Defaults to the AWS_DEFAULTS_MODE environment variable.
+  defaults_mode: S3DefaultsMode.optional(),
+  // Chunks whose BSON-serialized size falls below this byte threshold
+  // stay inline in MongoDB instead of being offloaded to S3. Default 1024.
+  inline_threshold_bytes: t.number.optional()
+});
+
+export const MongoStorageReadPreference = service_types.enumLiteral(
+  'primary',
+  'primaryPreferred',
+  'secondary',
+  'secondaryPreferred',
+  'nearest'
+);
+
+export type MongoStorageReadPreference = t.Encoded<typeof MongoStorageReadPreference>;
+
+export const MongoStorageConfig = service_types.configFile.BaseStorageConfig.and(lib_mongo.BaseMongoConfig).and(
   t.object({
-    // Add any mongo specific storage settings here in future
+    /**
+     * Read preference for bulk checksum and bucket data reads.
+     *
+     * If unset, MongoDB driver defaults are used for backwards compatibility.
+     *
+     * This is an experimental option, and may be removed in a future release.
+     */
+    bulk_read_preference: MongoStorageReadPreference.optional(),
+    /**
+     * Throttle clear operations after sync config deploys, by pausing between batches.
+     * The rate produces a pause proportional to the previous batch duration.
+     *
+     * Increase this to reduce impact of clear operations on the storage cluster.
+     * Use 0 to clear as fast as possible.
+     *
+     * Defaults to 0.2.
+     */
+    clear_batch_throttle_rate: t.number.optional(),
+
+    /** Maximum concurrent buckets across V3 chunk-compaction jobs. Range: 1–64. Default: 4 with object storage, otherwise 2. */
+    chunk_compaction_concurrency: t.number.optional(),
+
+    object_storage: S3ObjectStorageConfig.optional()
   })
 );
 
 export type MongoStorageConfig = t.Encoded<typeof MongoStorageConfig>;
 export type MongoStorageConfigDecoded = t.Decoded<typeof MongoStorageConfig>;
+
+export const DEFAULT_CLEAR_BATCH_THROTTLE_RATE = 0.2;
+export const DEFAULT_CHUNK_COMPACTION_CONCURRENCY = 2;
+export const DEFAULT_OBJECT_STORAGE_CHUNK_COMPACTION_CONCURRENCY = 4;
+
+export function normalizeChunkCompactionConcurrency(value: number | undefined, hasObjectStorage = false): number {
+  const concurrency =
+    value ??
+    (hasObjectStorage ? DEFAULT_OBJECT_STORAGE_CHUNK_COMPACTION_CONCURRENCY : DEFAULT_CHUNK_COMPACTION_CONCURRENCY);
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 64) {
+    throw new ServiceError(
+      ErrorCode.PSYNC_S3201,
+      'storage.chunk_compaction_concurrency must be an integer between 1 and 64'
+    );
+  }
+  return concurrency;
+}
+
+export function normalizeClearBatchThrottleRate(value: number | undefined): number {
+  const rate = value ?? DEFAULT_CLEAR_BATCH_THROTTLE_RATE;
+  if (!Number.isFinite(rate) || rate < 0 || rate > 20) {
+    throw new ServiceError(
+      ErrorCode.PSYNC_S3201,
+      'storage.clear_batch_throttle_rate must be a finite number between 0 and 20'
+    );
+  }
+  return rate;
+}
 
 export function isMongoStorageConfig(
   config: service_types.configFile.GenericStorageConfig

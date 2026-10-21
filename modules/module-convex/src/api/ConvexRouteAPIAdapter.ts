@@ -1,4 +1,4 @@
-import { api, ParseSyncRulesOptions, ReplicationHeadCallback, ReplicationLagOptions } from '@powersync/service-core';
+import { api, ParseSyncConfigOptions, ReplicationLagOptions } from '@powersync/service-core';
 import * as sync_rules from '@powersync/service-sync-rules';
 import * as service_types from '@powersync/service-types';
 import { isConvexCheckpointTable } from '../common/ConvexCheckpoints.js';
@@ -121,11 +121,15 @@ export class ConvexRouteAPIAdapter implements api.RouteAPI {
     return undefined;
   }
 
-  async createReplicationHead<T>(callback: ReplicationHeadCallback<T>): Promise<T> {
+  async createReplicationHead<T>(callback: api.ReplicationHeadCallback<T>): Promise<T> {
     const head = await this.connectionManager.client.getHeadCursor();
-    const result = await callback(parseConvexLsn(head));
-    await this.connectionManager.client.createWriteCheckpointMarker();
-    return result;
+    const { response, shouldAdvance } = await callback(parseConvexLsn(head));
+
+    if (shouldAdvance) {
+      await this.connectionManager.client.createWriteCheckpointMarker();
+    }
+
+    return response;
   }
 
   async getConnectionSchema(): Promise<service_types.DatabaseSchema[]> {
@@ -179,9 +183,10 @@ export class ConvexRouteAPIAdapter implements api.RouteAPI {
     await this.shutdown();
   }
 
-  getParseSyncRulesOptions(): ParseSyncRulesOptions {
+  getParseSyncRulesOptions(): ParseSyncConfigOptions {
     return {
-      defaultSchema: this.connectionManager.schema
+      defaultSchema: this.connectionManager.schema,
+      connections: { [this.connectionManager.connectionTag]: { type: this.config.type } }
     };
   }
 }
