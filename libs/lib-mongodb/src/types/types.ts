@@ -172,7 +172,7 @@ export function normalizeMongoConfig(options: BaseMongoConfigDecoded): Normalize
 
     username,
     password,
-    oidc: options.oidc,
+    oidc: uri.searchParams.get('authMechanism') == 'MONGODB-OIDC' ? options.oidc : undefined,
 
     lookup,
     connectionParams
