@@ -327,6 +327,28 @@ describe('config', () => {
     });
   });
 
+  describe('oidc', () => {
+    const oidc = { token_url: 'http://localhost:8099/token' };
+
+    test('keeps the oidc config when the URI asks for MONGODB-OIDC', () => {
+      const normalized = normalizeMongoConfig({
+        type: 'mongodb',
+        uri: 'mongodb+srv://cluster.example.net/powersync_test?authMechanism=MONGODB-OIDC&authSource=$external',
+        oidc
+      });
+      expect(normalized.oidc).toEqual(oidc);
+    });
+
+    test('drops the oidc config when the URI uses another mechanism', () => {
+      const normalized = normalizeMongoConfig({
+        type: 'mongodb',
+        uri: 'mongodb://localhost:27017/powersync_test?directConnection=true',
+        oidc
+      });
+      expect(normalized.oidc).toBeUndefined();
+    });
+  });
+
   describe('errors', () => {
     test('Should throw error when no database specified', () => {
       ['mongodb://localhost:27017', 'mongodb://localhost:27017/'].forEach((uri) => {
